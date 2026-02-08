@@ -1,29 +1,50 @@
-import type { API, Characteristic, DynamicPlatformPlugin, Logging, PlatformAccessory, PlatformConfig, Service } from 'homebridge';
+import type {
+  API,
+  Characteristic,
+  DynamicPlatformPlugin,
+  Logging,
+  PlatformAccessory,
+  PlatformConfig,
+  Service,
+} from 'homebridge';
 
-import { ExamplePlatformAccessory } from './platformAccessory.js';
+import { mapFunctionToServiceKind } from './constants.js';
+import { SuplaApiClient, type SuplaApiClientOptions } from './suplaApiClient.js';
+import { SuplaChannelAccessory } from './platformAccessory.js';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js';
+import {
+  getChannelDisplayName,
+  getChannelFunctionId,
+  type SuplaAccessoryContext,
+  type SuplaChannel,
+} from './types.js';
 
-// This is only required when using Custom Services and Characteristics not support by HomeKit
-import { EveHomeKitTypes } from 'homebridge-lib/EveHomeKitTypes';
+interface SuplaPlatformConfig extends PlatformConfig {
+  email?: string;
+  password?: string;
+  server?: string;
+  apiPrefix?: string;
+  pollIntervalSeconds?: number;
+  requestTimeoutMs?: number;
+  includeHidden?: boolean;
+}
 
-/**
- * HomebridgePlatform
- * This class is the main constructor for your plugin, this is where you should
- * parse the user config and discover/register accessories with Homebridge.
- */
-export class ExampleHomebridgePlatform implements DynamicPlatformPlugin {
+const DEFAULT_POLL_INTERVAL_SECONDS = 10;
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+
+export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
   public readonly Characteristic: typeof Characteristic;
 
-  // this is used to track restored cached accessories
-  public readonly accessories: Map<string, PlatformAccessory> = new Map();
-  public readonly discoveredCacheUUIDs: string[] = [];
+  public readonly accessories: Map<string, PlatformAccessory<SuplaAccessoryContext>> = new Map();
 
-  // This is only required when using Custom Services and Characteristics not support by HomeKit
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  public readonly CustomServices: any;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  public readonly CustomCharacteristics: any;
+  private readonly channelHandlers: Map<string, SuplaChannelAccessory> = new Map();
+  private readonly unsupportedFunctionsLogged: Set<number> = new Set();
+
+  private pollTimer: NodeJS.Timeout | undefined;
+  private pollInFlight = false;
+
+  private client: SuplaApiClient | undefined;
 
   constructor(
     public readonly log: Logging,
@@ -33,118 +54,226 @@ export class ExampleHomebridgePlatform implements DynamicPlatformPlugin {
     this.Service = api.hap.Service;
     this.Characteristic = api.hap.Characteristic;
 
-    // This is only required when using Custom Services and Characteristics not support by HomeKit
-    this.CustomServices = new EveHomeKitTypes(this.api).Services;
-    this.CustomCharacteristics = new EveHomeKitTypes(this.api).Characteristics;
-
-    this.log.debug('Finished initializing platform:', this.config.name);
-
-    // When this event is fired it means Homebridge has restored all cached accessories from disk.
-    // Dynamic Platform plugins should only register new accessories after this event was fired,
-    // in order to ensure they weren't added to homebridge already. This event can also be used
-    // to start discovery of new accessories.
     this.api.on('didFinishLaunching', () => {
-      log.debug('Executed didFinishLaunching callback');
-      // run the method to discover / register your devices as accessories
-      this.discoverDevices();
+      void this.start();
+    });
+
+    this.api.on('shutdown', () => {
+      this.stop();
     });
   }
 
-  /**
-   * This function is invoked when homebridge restores cached accessories from disk at startup.
-   * It should be used to set up event handlers for characteristics and update respective values.
-   */
-  configureAccessory(accessory: PlatformAccessory) {
-    this.log.info('Loading accessory from cache:', accessory.displayName);
-
-    // add the restored accessory to the accessories cache, so we can track if it has already been registered
-    this.accessories.set(accessory.UUID, accessory);
+  configureAccessory(accessory: PlatformAccessory): void {
+    this.accessories.set(accessory.UUID, accessory as PlatformAccessory<SuplaAccessoryContext>);
   }
 
-  /**
-   * This is an example method showing how to register discovered accessories.
-   * Accessories must only be registered once, previously created accessories
-   * must not be registered again to prevent "duplicate UUID" errors.
-   */
-  discoverDevices() {
-    // EXAMPLE ONLY
-    // A real plugin you would discover accessories from the local network, cloud services
-    // or a user-defined array in the platform config.
-    const exampleDevices = [
-      {
-        exampleUniqueId: 'ABCD',
-        exampleDisplayName: 'Bedroom',
-      },
-      {
-        exampleUniqueId: 'EFGH',
-        exampleDisplayName: 'Kitchen',
-      },
-      {
-        // This is an example of a device which uses a Custom Service
-        exampleUniqueId: 'IJKL',
-        exampleDisplayName: 'Backyard',
-        CustomService: 'AirPressureSensor',
-      },
-    ];
+  async executeChannelAction(channelId: number, payload: Record<string, unknown>): Promise<void> {
+    if (!this.client) {
+      throw new Error('SUPLA client is not initialized.');
+    }
 
-    // loop over the discovered devices and register each one if it has not already been registered
-    for (const device of exampleDevices) {
-      // generate a unique id for the accessory this should be generated from
-      // something globally unique, but constant, for example, the device serial
-      // number or MAC address
-      const uuid = this.api.hap.uuid.generate(device.exampleUniqueId);
+    await this.client.executeChannelAction(channelId, payload);
+  }
 
-      // see if an accessory with the same uuid has already been registered and restored from
-      // the cached devices we stored in the `configureAccessory` method above
-      const existingAccessory = this.accessories.get(uuid);
+  private async start(): Promise<void> {
+    const pluginConfig = this.getTypedConfig();
 
-      if (existingAccessory) {
-        // the accessory already exists
-        this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
+    if (!pluginConfig.email || !pluginConfig.password) {
+      this.log.error('SUPLA plugin requires both email and password in config.');
+      return;
+    }
 
-        // if you need to update the accessory.context then you should run `api.updatePlatformAccessories`. e.g.:
-        // existingAccessory.context.device = device;
-        // this.api.updatePlatformAccessories([existingAccessory]);
+    const clientOptions: SuplaApiClientOptions = {
+      email: pluginConfig.email,
+      password: pluginConfig.password,
+      server: pluginConfig.server,
+      apiPrefix: pluginConfig.apiPrefix,
+      requestTimeoutMs: this.getRequestTimeoutMs(pluginConfig),
+    };
 
-        // create the accessory handler for the restored accessory
-        // this is imported from `platformAccessory.ts`
-        new ExamplePlatformAccessory(this, existingAccessory);
+    this.client = new SuplaApiClient(clientOptions, {
+      debug: (message: string) => this.log.debug(message),
+      warn: (message: string) => this.log.warn(message),
+      error: (message: string) => this.log.error(message),
+    });
 
-        // it is possible to remove platform accessories at any time using `api.unregisterPlatformAccessories`, e.g.:
-        // remove platform accessories when no longer present
-        // this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [existingAccessory]);
-        // this.log.info('Removing existing accessory from cache:', existingAccessory.displayName);
+    try {
+      await this.client.initialize();
+    } catch (error) {
+      this.log.error(`SUPLA initialization failed: ${this.errorMessage(error)}`);
+      return;
+    }
+
+    await this.refreshChannels();
+    this.startPolling(this.getPollIntervalSeconds(pluginConfig));
+  }
+
+  private stop(): void {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = undefined;
+    }
+
+    for (const handler of this.channelHandlers.values()) {
+      handler.dispose();
+    }
+
+    this.channelHandlers.clear();
+  }
+
+  private startPolling(intervalSeconds: number): void {
+    this.pollTimer = setInterval(() => {
+      void this.refreshChannels();
+    }, intervalSeconds * 1000);
+
+    this.pollTimer.unref();
+  }
+
+  private async refreshChannels(): Promise<void> {
+    if (this.pollInFlight || !this.client) {
+      return;
+    }
+
+    this.pollInFlight = true;
+    try {
+      const channels = await this.client.listChannels();
+      this.syncAccessories(channels);
+    } catch (error) {
+      this.log.error(`SUPLA refresh failed: ${this.errorMessage(error)}`);
+    } finally {
+      this.pollInFlight = false;
+    }
+  }
+
+  private syncAccessories(channels: SuplaChannel[]): void {
+    const visibleChannels = channels.filter((channel) => this.shouldExposeChannel(channel));
+    const activeUuids = new Set<string>();
+
+    for (const channel of visibleChannels) {
+      const functionId = getChannelFunctionId(channel);
+      const serviceKind = mapFunctionToServiceKind(functionId);
+
+      if (!serviceKind) {
+        this.logUnsupportedFunction(functionId, channel.id);
+        continue;
+      }
+
+      const uniqueId = `supla-channel-${channel.id}`;
+      const uuid = this.api.hap.uuid.generate(uniqueId);
+      activeUuids.add(uuid);
+
+      const displayName = getChannelDisplayName(channel);
+      let accessory = this.accessories.get(uuid);
+      const isNewAccessory = !accessory;
+
+      if (!accessory) {
+        accessory = new this.api.platformAccessory<SuplaAccessoryContext>(displayName, uuid);
+      }
+
+      const context: SuplaAccessoryContext = {
+        channelId: channel.id,
+        functionId,
+        serviceKind,
+        uniqueId,
+      };
+      let needsAccessoryUpdate = false;
+      const previousContext = accessory.context;
+      if (
+        previousContext?.channelId !== context.channelId
+        || previousContext?.functionId !== context.functionId
+        || previousContext?.serviceKind !== context.serviceKind
+        || previousContext?.uniqueId !== context.uniqueId
+      ) {
+        needsAccessoryUpdate = true;
+      }
+      accessory.context = context;
+
+      if (accessory.displayName !== displayName) {
+        accessory.displayName = displayName;
+        needsAccessoryUpdate = true;
+      }
+
+      const currentHandler = this.channelHandlers.get(uuid);
+      if (!currentHandler || currentHandler.serviceKind !== serviceKind) {
+        currentHandler?.dispose();
+        const nextHandler = new SuplaChannelAccessory(this, accessory, channel, serviceKind);
+        this.channelHandlers.set(uuid, nextHandler);
+        needsAccessoryUpdate = true;
       } else {
-        // the accessory does not yet exist, so we need to create it
-        this.log.info('Adding new accessory:', device.exampleDisplayName);
+        currentHandler.updateFromChannel(channel);
+      }
 
-        // create a new accessory
-        const accessory = new this.api.platformAccessory(device.exampleDisplayName, uuid);
+      this.accessories.set(uuid, accessory);
 
-        // store a copy of the device object in the `accessory.context`
-        // the `context` property can be used to store any data about the accessory you may need
-        accessory.context.device = device;
-
-        // create the accessory handler for the newly create accessory
-        // this is imported from `platformAccessory.ts`
-        new ExamplePlatformAccessory(this, accessory);
-
-        // link the accessory to your platform
+      if (isNewAccessory) {
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      } else if (needsAccessoryUpdate) {
+        this.api.updatePlatformAccessories([accessory]);
       }
-
-      // push into discoveredCacheUUIDs
-      this.discoveredCacheUUIDs.push(uuid);
     }
 
-    // you can also deal with accessories from the cache which are no longer present by removing them from Homebridge
-    // for example, if your plugin logs into a cloud account to retrieve a device list, and a user has previously removed a device
-    // from this cloud account, then this device will no longer be present in the device list but will still be in the Homebridge cache
+    this.removeStaleAccessories(activeUuids);
+  }
+
+  private removeStaleAccessories(activeUuids: Set<string>): void {
     for (const [uuid, accessory] of this.accessories) {
-      if (!this.discoveredCacheUUIDs.includes(uuid)) {
-        this.log.info('Removing existing accessory from cache:', accessory.displayName);
-        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      if (activeUuids.has(uuid)) {
+        continue;
       }
+
+      this.channelHandlers.get(uuid)?.dispose();
+      this.channelHandlers.delete(uuid);
+      this.accessories.delete(uuid);
+
+      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
     }
+  }
+
+  private shouldExposeChannel(channel: SuplaChannel): boolean {
+    const includeHidden = this.getTypedConfig().includeHidden ?? false;
+    if (!includeHidden && channel.hidden) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private logUnsupportedFunction(functionId: number, channelId: number): void {
+    if (this.unsupportedFunctionsLogged.has(functionId)) {
+      return;
+    }
+
+    this.unsupportedFunctionsLogged.add(functionId);
+    this.log.warn(`Skipping unsupported SUPLA function ${functionId} (first seen on channel ${channelId}).`);
+  }
+
+  private getTypedConfig(): SuplaPlatformConfig {
+    return this.config as SuplaPlatformConfig;
+  }
+
+  private getPollIntervalSeconds(config: SuplaPlatformConfig): number {
+    const configured = config.pollIntervalSeconds ?? DEFAULT_POLL_INTERVAL_SECONDS;
+    if (!Number.isFinite(configured)) {
+      return DEFAULT_POLL_INTERVAL_SECONDS;
+    }
+
+    return Math.max(2, Math.min(120, Math.round(configured)));
+  }
+
+  private getRequestTimeoutMs(config: SuplaPlatformConfig): number {
+    const configured = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    if (!Number.isFinite(configured)) {
+      return DEFAULT_REQUEST_TIMEOUT_MS;
+    }
+
+    return Math.max(2_000, Math.min(60_000, Math.round(configured)));
+  }
+
+  private errorMessage(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    return String(error);
   }
 }

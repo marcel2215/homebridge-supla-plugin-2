@@ -1,17 +1,65 @@
 {
-  "pluginAlias": "ExampleHomebridgePlugin",
+  "pluginAlias": "SuplaPlatform",
   "pluginType": "platform",
   "singular": true,
-  "strictValidation": false,
+  "strictValidation": true,
   "schema": {
     "type": "object",
-    "required": ["name"],
+    "required": [
+      "name",
+      "email",
+      "password"
+    ],
     "additionalProperties": false,
     "properties": {
       "name": {
         "title": "Name",
         "type": "string",
-        "default": "Example Dynamic Platform"
+        "default": "SUPLA"
+      },
+      "email": {
+        "title": "SUPLA Email",
+        "type": "string",
+        "format": "email",
+        "description": "Email used to log in to SUPLA mobile app/cloud."
+      },
+      "password": {
+        "title": "SUPLA Password",
+        "type": "string",
+        "minLength": 1,
+        "description": "Password used to log in to SUPLA mobile app/cloud."
+      },
+      "server": {
+        "title": "Server Override",
+        "type": "string",
+        "description": "Optional SUPLA cloud server hostname or URL. If omitted, autodiscover is used."
+      },
+      "apiPrefix": {
+        "title": "API Prefix Override",
+        "type": "string",
+        "description": "Optional API prefix override (for example /api/3)."
+      },
+      "pollIntervalSeconds": {
+        "title": "Polling Interval (s)",
+        "type": "integer",
+        "minimum": 2,
+        "maximum": 120,
+        "default": 10,
+        "description": "How often channel states are refreshed from SUPLA cloud."
+      },
+      "requestTimeoutMs": {
+        "title": "Request Timeout (ms)",
+        "type": "integer",
+        "minimum": 2000,
+        "maximum": 60000,
+        "default": 10000,
+        "description": "Timeout for SUPLA cloud HTTP requests."
+      },
+      "includeHidden": {
+        "title": "Include Hidden Channels",
+        "type": "boolean",
+        "default": false,
+        "description": "Expose channels that are hidden in SUPLA cloud."
       }
     }
   }
