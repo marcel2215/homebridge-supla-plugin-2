@@ -301,6 +301,11 @@ export function isDigiglassFunction(functionId: number): boolean {
     || functionId === SUPLA_FUNCTION.DIGIGLASS_VERTICAL;
 }
 
+export function isReversedShadingSystemFunction(functionId: number): boolean {
+  return functionId === SUPLA_FUNCTION.TERRACE_AWNING
+    || functionId === SUPLA_FUNCTION.PROJECTOR_SCREEN;
+}
+
 export function mapFunctionToServiceKind(functionId: number): ServiceKind | undefined {
   if (isLightFunction(functionId)) {
     return 'light';

@@ -26,9 +26,16 @@ interface RequestOptions {
   body?: unknown;
   retryOnUnauthorized?: boolean;
   includeAuth?: boolean;
+  retryOnTransient?: boolean;
+  maxRetries?: number;
 }
 
 const DEFAULT_API_PREFIX_CANDIDATES = ['/api/3', '/api/v3', '/api'];
+const TRANSIENT_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const DEFAULT_TRANSIENT_RETRY_COUNT = 2;
+const BASE_RETRY_DELAY_MS = 500;
+const MAX_RETRY_DELAY_MS = 15_000;
+const ERROR_TEXT_MAX_LENGTH = 500;
 
 export class SuplaApiClient {
   private baseUrl = '';
@@ -67,6 +74,8 @@ export class SuplaApiClient {
       },
       retryOnUnauthorized: true,
       includeAuth: true,
+      retryOnTransient: true,
+      maxRetries: 3,
     });
 
     if (!Array.isArray(payload)) {
@@ -81,7 +90,7 @@ export class SuplaApiClient {
       }
 
       const rawId = asNumber((item as Record<string, unknown>).id);
-      if (!rawId) {
+      if (rawId === undefined) {
         continue;
       }
 
@@ -100,6 +109,8 @@ export class SuplaApiClient {
       body: payload,
       retryOnUnauthorized: true,
       includeAuth: true,
+      retryOnTransient: false,
+      maxRetries: 0,
     });
   }
 
@@ -122,6 +133,8 @@ export class SuplaApiClient {
     const payload = await this.requestUnknown('GET', url, {
       retryOnUnauthorized: false,
       includeAuth: false,
+      retryOnTransient: true,
+      maxRetries: 3,
     });
 
     if (!payload || typeof payload !== 'object') {
@@ -156,6 +169,8 @@ export class SuplaApiClient {
           query: { include: 'state', io: 'output' },
           retryOnUnauthorized: true,
           includeAuth: true,
+          retryOnTransient: true,
+          maxRetries: 2,
         });
 
         if (Array.isArray(payload)) {
@@ -226,6 +241,8 @@ export class SuplaApiClient {
       body,
       includeAuth: false,
       retryOnUnauthorized: false,
+      retryOnTransient: true,
+      maxRetries: 2,
     });
 
     if (!tokenPayload || typeof tokenPayload !== 'object') {
@@ -250,13 +267,17 @@ export class SuplaApiClient {
       await this.ensureAuthenticated(false);
     }
 
-    const response = await this.performRequest(method, rawPath, options);
+    const url = this.buildUrl(rawPath, options.query);
+    const response = await this.performRequestWithRetry(method, url, options);
 
     if (response.status === 401 && options.includeAuth && options.retryOnUnauthorized) {
+      this.logger.warn(`SUPLA HTTP 401 for ${method} ${this.redactUrlForLog(url)}; forcing token refresh.`);
       await this.ensureAuthenticated(true);
-      const retryResponse = await this.performRequest(method, rawPath, {
+      const retryResponse = await this.performRequestWithRetry(method, url, {
         ...options,
         retryOnUnauthorized: false,
+        retryOnTransient: false,
+        maxRetries: 0,
       });
       return this.deserializeResponse(retryResponse, rawPath);
     }
@@ -264,9 +285,58 @@ export class SuplaApiClient {
     return this.deserializeResponse(response, rawPath);
   }
 
-  private async performRequest(method: string, rawPath: string, options: RequestOptions): Promise<Response> {
-    const url = this.buildUrl(rawPath, options.query);
+  private async performRequestWithRetry(
+    method: string,
+    url: string,
+    options: RequestOptions,
+  ): Promise<Response> {
+    const retries = Math.max(0, options.maxRetries ?? DEFAULT_TRANSIENT_RETRY_COUNT);
+    const maxAttempts = options.retryOnTransient ? 1 + retries : 1;
+    const redactedUrl = this.redactUrlForLog(url);
 
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const startedAt = Date.now();
+      try {
+        const response = await this.performRequest(method, url, options);
+        const durationMs = Date.now() - startedAt;
+        this.logger.debug(
+          `SUPLA HTTP ${method} ${redactedUrl} -> ${response.status} in ${durationMs}ms (attempt ${attempt}/${maxAttempts})`,
+        );
+
+        if (
+          attempt < maxAttempts
+          && this.shouldRetryStatus(response.status)
+        ) {
+          const delayMs = this.getRetryDelayMs(attempt, response);
+          this.logger.warn(
+            `SUPLA transient HTTP ${response.status} on ${method} ${redactedUrl}; retrying in ${delayMs}ms.`,
+          );
+          await this.delay(delayMs);
+          continue;
+        }
+
+        return response;
+      } catch (error) {
+        const durationMs = Date.now() - startedAt;
+        const errorText = this.errorMessage(error);
+        this.logger.warn(
+          `SUPLA HTTP ${method} ${redactedUrl} failed in ${durationMs}ms (attempt ${attempt}/${maxAttempts}): ${errorText}`,
+        );
+
+        if (attempt < maxAttempts && this.shouldRetryError(error)) {
+          const delayMs = this.getRetryDelayMs(attempt);
+          await this.delay(delayMs);
+          continue;
+        }
+
+        throw new Error(`SUPLA request failed on ${redactedUrl}: ${errorText}`);
+      }
+    }
+
+    throw new Error(`SUPLA request failed on ${redactedUrl}: exhausted retries.`);
+  }
+
+  private async performRequest(method: string, url: string, options: RequestOptions): Promise<Response> {
     const headers = new Headers();
     if (options.includeAuth) {
       headers.set('Authorization', `Bearer ${this.accessToken}`);
@@ -319,6 +389,85 @@ export class SuplaApiClient {
     return url.toString();
   }
 
+  private shouldRetryStatus(status: number): boolean {
+    return TRANSIENT_HTTP_STATUSES.has(status);
+  }
+
+  private shouldRetryError(error: unknown): boolean {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      return true;
+    }
+
+    if (error instanceof TypeError) {
+      return true;
+    }
+
+    const message = this.errorMessage(error).toLowerCase();
+    return message.includes('network')
+      || message.includes('timeout')
+      || message.includes('abort');
+  }
+
+  private getRetryDelayMs(attempt: number, response?: Response): number {
+    const retryAfterMs = this.getRetryAfterMs(response);
+    if (retryAfterMs !== undefined) {
+      return retryAfterMs;
+    }
+
+    const exponentialDelay = BASE_RETRY_DELAY_MS * (2 ** Math.max(0, attempt - 1));
+    return Math.min(exponentialDelay, MAX_RETRY_DELAY_MS);
+  }
+
+  private getRetryAfterMs(response: Response | undefined): number | undefined {
+    if (!response) {
+      return undefined;
+    }
+
+    const header = response.headers.get('retry-after');
+    if (!header) {
+      return undefined;
+    }
+
+    const seconds = Number(header);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.min(seconds * 1000, MAX_RETRY_DELAY_MS);
+    }
+
+    const dateMs = Date.parse(header);
+    if (Number.isFinite(dateMs)) {
+      return Math.min(Math.max(0, dateMs - Date.now()), MAX_RETRY_DELAY_MS);
+    }
+
+    return undefined;
+  }
+
+  private redactUrlForLog(rawUrl: string): string {
+    try {
+      const parsed = new URL(rawUrl);
+      const pathParts = parsed.pathname.split('/');
+      const usersIndex = pathParts.findIndex((part) => part === 'users');
+      if (usersIndex >= 0 && usersIndex + 1 < pathParts.length) {
+        pathParts[usersIndex + 1] = '***';
+      }
+      parsed.pathname = pathParts.join('/');
+      parsed.search = '';
+      return parsed.toString();
+    } catch {
+      return rawUrl;
+    }
+  }
+
+  private async delay(ms: number): Promise<void> {
+    if (ms <= 0) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      timer.unref();
+    });
+  }
+
   private async deserializeResponse(response: Response, path: string): Promise<unknown> {
     if (!response.ok) {
       const bodyText = await this.safeReadResponse(response);
@@ -344,8 +493,16 @@ export class SuplaApiClient {
 
   private async safeReadResponse(response: Response): Promise<string> {
     try {
-      const text = await response.text();
-      return text.trim();
+      const text = (await response.text()).trim().replace(/\s+/g, ' ');
+      if (!text) {
+        return '';
+      }
+
+      if (text.length > ERROR_TEXT_MAX_LENGTH) {
+        return `${text.slice(0, ERROR_TEXT_MAX_LENGTH)}...`;
+      }
+
+      return text;
     } catch {
       return '';
     }

@@ -6,6 +6,7 @@ import {
   isDigiglassFunction,
   isDimmerFunction,
   isGarageDoorFunction,
+  isReversedShadingSystemFunction,
   isRgbFunction,
   isTiltableWindowCoveringFunction,
   isVerticalBlindFunction,
@@ -29,6 +30,7 @@ import {
 } from './utils.js';
 
 const WINDOW_POSITION_TOLERANCE = 2;
+const TILT_ANGLE_TOLERANCE = 2;
 
 export class SuplaChannelAccessory {
   public readonly serviceKind: ServiceKind;
@@ -49,6 +51,7 @@ export class SuplaChannelAccessory {
   private cachedSaturation = 0;
   private cachedBrightness = 100;
   private cachedColorBrightness = 100;
+  private lastConnectionState: boolean | undefined;
 
   constructor(
     private readonly platform: SuplaHomebridgePlatform,
@@ -81,6 +84,10 @@ export class SuplaChannelAccessory {
       ?? asBoolean(channel.connected)
       ?? true;
     this.applyConnectionState(connected);
+    this.platform.log.debug(
+      `SUPLA channel ${channel.id} state update: service=${this.serviceKind}, connected=${connected}, `
+      + `on=${String(state.on)}, hi=${String(state.hi)}, shut=${String(state.shut)}`,
+    );
 
     switch (this.serviceKind) {
     case 'outlet':
@@ -147,6 +154,10 @@ export class SuplaChannelAccessory {
 
   dispose(): void {
     // Reserved for timers/subscriptions in future revisions.
+  }
+
+  setCloudReachability(reachable: boolean): void {
+    this.applyConnectionState(reachable);
   }
 
   private configureServices(): { main: Service; auxiliary?: Service } {
@@ -328,6 +339,16 @@ export class SuplaChannelAccessory {
   }
 
   private applyConnectionState(connected: boolean): void {
+    if (this.lastConnectionState !== connected) {
+      const displayName = getChannelDisplayName(this.channel);
+      if (connected) {
+        this.platform.log.info(`SUPLA channel ${this.channel.id} (${displayName}) is reachable.`);
+      } else {
+        this.platform.log.warn(`SUPLA channel ${this.channel.id} (${displayName}) is unreachable.`);
+      }
+      this.lastConnectionState = connected;
+    }
+
     for (const service of this.accessory.services) {
       this.updateIfPresent(service, this.platform.Characteristic.StatusActive, connected);
       this.updateIfPresent(
@@ -457,7 +478,8 @@ export class SuplaChannelAccessory {
   }
 
   private updateContactState(state: SuplaChannelState): void {
-    const isOpen = (asBoolean(state.partial_hi) ?? false) || (asBoolean(state.hi) ?? false);
+    const closed = this.readClosedState(state);
+    const isOpen = closed === undefined ? false : !closed;
 
     this.mainService.updateCharacteristic(
       this.platform.Characteristic.ContactSensorState,
@@ -704,7 +726,6 @@ export class SuplaChannelAccessory {
 
   private async handleWindowTargetPositionSet(value: CharacteristicValue): Promise<void> {
     const target = clampNumber(Number(value), 0, 100);
-    const current = this.openPercentFromState(this.channel.state ?? {}) ?? target;
     this.targetPosition = target;
     const functionId = getChannelFunctionId(this.channel);
 
@@ -723,15 +744,7 @@ export class SuplaChannelAccessory {
       return;
     }
 
-    if (target > current) {
-      await this.executeAction({
-        action: SUPLA_ACTION.REVEAL_PARTIALLY,
-        percentage: Math.round(target),
-      });
-      return;
-    }
-
-    const closedPercent = 100 - target;
+    const closedPercent = this.closedPercentFromOpenPercent(target, functionId);
     await this.executeAction({
       action: SUPLA_ACTION.SHUT_PARTIALLY,
       percentage: Math.round(closedPercent),
@@ -780,6 +793,7 @@ export class SuplaChannelAccessory {
 
     const openRequested = target === this.platform.Characteristic.TargetDoorState.OPEN;
     const functionId = getChannelFunctionId(this.channel);
+    const state = this.channel.state ?? {};
 
     if (functionId === SUPLA_FUNCTION.ROLLER_GARAGE_DOOR) {
       await this.executeAction({
@@ -788,10 +802,31 @@ export class SuplaChannelAccessory {
       return;
     }
 
-    if (isGarageDoorFunction(functionId)) {
+    if (
+      functionId === SUPLA_FUNCTION.CONTROLLING_THE_GATE
+      || functionId === SUPLA_FUNCTION.CONTROLLING_THE_GARAGE_DOOR
+    ) {
+      const currentDoorState = this.readGarageCurrentDoorState(state);
+      const alreadyInRequestedState = openRequested
+        ? currentDoorState === this.platform.Characteristic.CurrentDoorState.OPEN
+        : currentDoorState === this.platform.Characteristic.CurrentDoorState.CLOSED;
+      if (alreadyInRequestedState) {
+        this.platform.log.debug(
+          `SUPLA channel ${this.channel.id}: gate/garage already ${
+            openRequested ? 'open' : 'closed'
+          }, skipping OPEN_CLOSE toggle.`,
+        );
+        return;
+      }
+
       await this.executeAction({
-        action: openRequested ? SUPLA_ACTION.OPEN : SUPLA_ACTION.CLOSE,
+        action: SUPLA_ACTION.OPEN_CLOSE,
       });
+      return;
+    }
+
+    if (isGarageDoorFunction(functionId)) {
+      await this.executeAction({ action: openRequested ? SUPLA_ACTION.OPEN : SUPLA_ACTION.CLOSE });
     }
   }
 
@@ -907,15 +942,6 @@ export class SuplaChannelAccessory {
 
   private async handleValveActiveSet(value: CharacteristicValue): Promise<void> {
     const active = Number(value) === this.platform.Characteristic.Active.ACTIVE;
-    const functionId = getChannelFunctionId(this.channel);
-
-    if (functionId === SUPLA_FUNCTION.VALVE_PERCENTAGE && active) {
-      await this.executeAction({
-        action: SUPLA_ACTION.OPEN_PARTIALLY,
-        percentage: 100,
-      });
-      return;
-    }
 
     await this.executeAction({
       action: active ? SUPLA_ACTION.OPEN : SUPLA_ACTION.CLOSE,
@@ -923,11 +949,15 @@ export class SuplaChannelAccessory {
   }
 
   private async executeAction(payload: Record<string, unknown>): Promise<void> {
+    const payloadText = this.serializeForLog(payload);
+    this.platform.log.debug(`SUPLA action request channel ${this.channel.id}: ${payloadText}`);
+
     try {
       await this.platform.executeChannelAction(this.channel.id, payload);
+      this.platform.log.debug(`SUPLA action success channel ${this.channel.id}: ${payloadText}`);
     } catch (error) {
       const errorText = error instanceof Error ? error.message : String(error);
-      this.platform.log.error(`SUPLA action failed on channel ${this.channel.id}: ${errorText}`);
+      this.platform.log.error(`SUPLA action failed on channel ${this.channel.id}: ${payloadText}; error=${errorText}`);
       throw new this.platform.api.hap.HapStatusError(
         this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
       );
@@ -1003,6 +1033,13 @@ export class SuplaChannelAccessory {
       return;
     }
 
+    if (
+      this.targetPosition !== undefined
+      && Math.abs(this.targetPosition - position) <= WINDOW_POSITION_TOLERANCE
+    ) {
+      this.targetPosition = undefined;
+    }
+
     const target = this.targetPosition ?? position;
     let positionState = this.platform.Characteristic.PositionState.STOPPED;
 
@@ -1026,6 +1063,12 @@ export class SuplaChannelAccessory {
     }
 
     const currentTiltAngle = this.tiltAngleFromPercent(tiltPercent);
+    if (
+      this.targetTiltAngle !== undefined
+      && Math.abs(this.targetTiltAngle - currentTiltAngle) <= TILT_ANGLE_TOLERANCE
+    ) {
+      this.targetTiltAngle = undefined;
+    }
     const targetTiltAngle = this.targetTiltAngle ?? currentTiltAngle;
 
     if (isVerticalBlindFunction(functionId)) {
@@ -1132,17 +1175,36 @@ export class SuplaChannelAccessory {
   }
 
   private openPercentFromState(state: SuplaChannelState): number | undefined {
+    const functionId = getChannelFunctionId(this.channel);
     const shut = asNumber(state.shut);
     if (shut !== undefined) {
+      if (isReversedShadingSystemFunction(functionId)) {
+        return clampNumber(shut, 0, 100);
+      }
+
       return clampNumber(100 - shut, 0, 100);
     }
 
-    const hi = asBoolean(state.hi);
-    if (hi !== undefined) {
-      return hi ? 100 : 0;
+    const gateLikeState = this.readGateLikeState(state);
+    if (gateLikeState === 'open') {
+      return 100;
+    }
+    if (gateLikeState === 'closed') {
+      return 0;
+    }
+    if (gateLikeState === 'partial') {
+      return 50;
     }
 
     return undefined;
+  }
+
+  private closedPercentFromOpenPercent(openPercent: number, functionId: number): number {
+    if (isReversedShadingSystemFunction(functionId)) {
+      return clampNumber(openPercent, 0, 100);
+    }
+
+    return clampNumber(100 - openPercent, 0, 100);
   }
 
   private readGarageCurrentDoorState(state: SuplaChannelState): number {
@@ -1159,10 +1221,15 @@ export class SuplaChannelAccessory {
       return this.platform.Characteristic.CurrentDoorState.STOPPED;
     }
 
-    const open = (asBoolean(state.partial_hi) ?? false) || (asBoolean(state.hi) ?? false);
-    return open
-      ? this.platform.Characteristic.CurrentDoorState.OPEN
-      : this.platform.Characteristic.CurrentDoorState.CLOSED;
+    const gateLikeState = this.readGateLikeState(state);
+    if (gateLikeState === 'open') {
+      return this.platform.Characteristic.CurrentDoorState.OPEN;
+    }
+    if (gateLikeState === 'closed') {
+      return this.platform.Characteristic.CurrentDoorState.CLOSED;
+    }
+
+    return this.platform.Characteristic.CurrentDoorState.STOPPED;
   }
 
   private readGarageTargetDoorState(state: SuplaChannelState): number {
@@ -1173,21 +1240,21 @@ export class SuplaChannelAccessory {
         : this.platform.Characteristic.TargetDoorState.CLOSED;
     }
 
-    const open = (asBoolean(state.partial_hi) ?? false) || (asBoolean(state.hi) ?? false);
-    return open
-      ? this.platform.Characteristic.TargetDoorState.OPEN
-      : this.platform.Characteristic.TargetDoorState.CLOSED;
+    const gateLikeState = this.readGateLikeState(state);
+    if (gateLikeState === 'open') {
+      return this.platform.Characteristic.TargetDoorState.OPEN;
+    }
+    if (gateLikeState === 'closed') {
+      return this.platform.Characteristic.TargetDoorState.CLOSED;
+    }
+
+    return this.targetDoorState ?? this.platform.Characteristic.TargetDoorState.CLOSED;
   }
 
   private readUnlockedState(state: SuplaChannelState): boolean {
-    const closed = asBoolean(state.closed);
+    const closed = this.readClosedState(state);
     if (closed !== undefined) {
       return !closed;
-    }
-
-    const hi = asBoolean(state.hi);
-    if (hi !== undefined) {
-      return hi;
     }
 
     return asBoolean(state.on) ?? false;
@@ -1267,7 +1334,7 @@ export class SuplaChannelAccessory {
   }
 
   private readValveActiveState(state: SuplaChannelState): boolean {
-    const closed = asBoolean(state.closed);
+    const closed = this.readClosedState(state);
     if (closed !== undefined) {
       return !closed;
     }
@@ -1283,6 +1350,68 @@ export class SuplaChannelAccessory {
     }
 
     return false;
+  }
+
+  private readClosedState(state: SuplaChannelState): boolean | undefined {
+    const closed = asBoolean(state.closed);
+    if (closed !== undefined) {
+      return closed;
+    }
+
+    const hi = asBoolean(state.hi);
+    if (hi !== undefined) {
+      return hi;
+    }
+
+    return undefined;
+  }
+
+  private readGateLikeState(state: SuplaChannelState): 'open' | 'closed' | 'partial' | undefined {
+    const stateRecord = state as Record<string, unknown>;
+    const rawValue = asNumber(stateRecord.subValueHi)
+      ?? asNumber(stateRecord.sub_value_hi)
+      ?? asNumber(stateRecord.valueHi)
+      ?? asNumber(stateRecord.value_hi);
+
+    if (rawValue !== undefined) {
+      const normalizedValue = Math.trunc(rawValue);
+      if ((normalizedValue & 0x2) === 0x2 && (normalizedValue & 0x1) === 0) {
+        return 'partial';
+      }
+
+      if (normalizedValue > 0) {
+        return 'closed';
+      }
+
+      return 'open';
+    }
+
+    const hi = asBoolean(state.hi);
+    const partialHi = asBoolean(state.partial_hi) ?? false;
+
+    if (partialHi && hi === false) {
+      return 'partial';
+    }
+
+    if (hi !== undefined) {
+      return hi ? 'closed' : 'open';
+    }
+
+    const closed = asBoolean(state.closed);
+    if (closed !== undefined) {
+      return closed ? 'closed' : 'open';
+    }
+
+    return undefined;
+  }
+
+  private serializeForLog(payload: Record<string, unknown>): string {
+    try {
+      const serialized = JSON.stringify(payload);
+      return serialized.length > 500 ? `${serialized.slice(0, 500)}...` : serialized;
+    } catch {
+      return '[unserializable-payload]';
+    }
   }
 
   private updateIfPresent(
