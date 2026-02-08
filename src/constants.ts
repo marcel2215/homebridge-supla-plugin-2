@@ -121,6 +121,11 @@ const LIGHT_FUNCTIONS = new Set<number>([
   SUPLA_FUNCTION.DIMMER_CCT_AND_RGB,
 ]);
 
+const CCT_FUNCTIONS = new Set<number>([
+  SUPLA_FUNCTION.DIMMER_CCT,
+  SUPLA_FUNCTION.DIMMER_CCT_AND_RGB,
+]);
+
 const SWITCH_FUNCTIONS = new Set<number>([
   SUPLA_FUNCTION.LIGHT_SWITCH,
   SUPLA_FUNCTION.STAIRCASE_TIMER,
@@ -223,6 +228,10 @@ export function isRgbFunction(functionId: number): boolean {
   return functionId === SUPLA_FUNCTION.RGB_LIGHTING
     || functionId === SUPLA_FUNCTION.DIMMER_AND_RGB_LIGHTING
     || functionId === SUPLA_FUNCTION.DIMMER_CCT_AND_RGB;
+}
+
+export function isCctFunction(functionId: number): boolean {
+  return CCT_FUNCTIONS.has(functionId);
 }
 
 export function isDimmerFunction(functionId: number): boolean {

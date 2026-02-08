@@ -19,6 +19,12 @@ export interface SuplaChannelFunction {
   name?: string;
 }
 
+export interface SuplaChannelFunctionAction {
+  id?: number;
+  name?: string;
+  caption?: string;
+}
+
 export interface SuplaChannelHsv {
   hue?: number;
   saturation?: number;
@@ -37,8 +43,10 @@ export interface SuplaChannelState {
   on?: boolean;
   hi?: boolean;
   partial_hi?: boolean;
+  partialHi?: boolean;
   brightness?: number;
   color_brightness?: number;
+  colorBrightness?: number;
   color?: string;
   hue?: number;
   hsv?: SuplaChannelHsv;
@@ -59,6 +67,19 @@ export interface SuplaChannelState {
   fillLevel?: number;
   warningLevel?: boolean;
   alarmLevel?: boolean;
+  manual?: boolean;
+  countdownTimer?: boolean;
+  thermometerError?: boolean;
+  clockError?: boolean;
+  forcedOffBySensor?: boolean;
+  weeklyScheduleTemporalOverride?: boolean;
+  batteryCoverOpen?: boolean;
+  calibrationError?: boolean;
+  currentOverload?: boolean;
+  notCalibrated?: boolean;
+  executing?: boolean;
+  millisecondsFromStart?: number;
+  millisecondsToEnd?: number;
   mode?: string;
   heating?: boolean;
   cooling?: boolean;
@@ -70,14 +91,62 @@ export interface SuplaChannelState {
   [key: string]: unknown;
 }
 
+export interface SuplaChannelConfigHvacTemperatureConstraints {
+  roomMin?: number;
+  roomMax?: number;
+  auxMin?: number;
+  auxMax?: number;
+  histeresisMin?: number;
+  histeresisMax?: number;
+  autoOffsetMin?: number;
+  autoOffsetMax?: number;
+  [key: string]: unknown;
+}
+
+export interface SuplaChannelConfigHvacTemperatures {
+  auxMinSetpoint?: number;
+  auxMaxSetpoint?: number;
+  roomMin?: number;
+  roomMax?: number;
+  auxMin?: number;
+  auxMax?: number;
+  [key: string]: unknown;
+}
+
+export interface SuplaChannelConfig {
+  openingSensorChannelId?: number;
+  openingSensorSecondaryChannelId?: number;
+  relayTimeMs?: number;
+  stateVerificationMethodActive?: boolean;
+
+  subfunction?: string;
+  temperatureControlType?: string;
+  heatingModeAvailable?: boolean;
+  coolingModeAvailable?: boolean;
+  binarySensorChannelId?: number;
+  temperatureConstraints?: SuplaChannelConfigHvacTemperatureConstraints;
+  temperatures?: SuplaChannelConfigHvacTemperatures;
+
+  tiltControlType?: string;
+  tilt0Angle?: number;
+  tilt100Angle?: number;
+  [key: string]: unknown;
+}
+
 export interface SuplaChannel {
   id: number;
   caption?: string;
   hidden?: boolean;
+  channelNumber?: number;
+  param1?: number;
+  param2?: number;
+  param3?: number;
   functionId?: number;
   function?: SuplaChannelFunction;
+  possibleActions?: SuplaChannelFunctionAction[];
   connected?: boolean;
   state?: SuplaChannelState;
+  config?: SuplaChannelConfig;
   iodevice?: {
     id?: number;
     name?: string;

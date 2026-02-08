@@ -2,6 +2,7 @@ import { asNumber } from './utils.js';
 import type {
   SuplaAutodiscoverResponse,
   SuplaChannel,
+  SuplaChannelState,
   SuplaTokenResponse,
 } from './types.js';
 
@@ -28,6 +29,12 @@ interface RequestOptions {
   includeAuth?: boolean;
   retryOnTransient?: boolean;
   maxRetries?: number;
+}
+
+export interface SuplaChannelStateSnapshot {
+  id: number;
+  connected?: boolean;
+  state?: SuplaChannelState;
 }
 
 const DEFAULT_API_PREFIX_CANDIDATES = ['/api/3', '/api/v3', '/api'];
@@ -68,15 +75,46 @@ export class SuplaApiClient {
   }
 
   async listChannels(): Promise<SuplaChannel[]> {
-    const payload = await this.requestUnknown('GET', `${this.apiPrefix}/channels`, {
-      query: {
-        include: 'state,connected,location,iodevice,supportedFunctions',
-      },
-      retryOnUnauthorized: true,
-      includeAuth: true,
-      retryOnTransient: true,
-      maxRetries: 3,
-    });
+    let payload: unknown;
+    try {
+      payload = await this.requestUnknown('GET', `${this.apiPrefix}/channels`, {
+        query: {
+          include: 'state,connected,location,iodevice,supportedFunctions,possibleActions,config',
+        },
+        retryOnUnauthorized: true,
+        includeAuth: true,
+        retryOnTransient: true,
+        maxRetries: 3,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `SUPLA channels request with extended include failed, retrying without config include: ${this.errorMessage(error)}`,
+      );
+      try {
+        payload = await this.requestUnknown('GET', `${this.apiPrefix}/channels`, {
+          query: {
+            include: 'state,connected,location,iodevice,supportedFunctions,possibleActions',
+          },
+          retryOnUnauthorized: true,
+          includeAuth: true,
+          retryOnTransient: true,
+          maxRetries: 3,
+        });
+      } catch (fallbackError) {
+        this.logger.warn(
+          `SUPLA channels request with possibleActions include failed, retrying with minimal include: ${this.errorMessage(fallbackError)}`,
+        );
+        payload = await this.requestUnknown('GET', `${this.apiPrefix}/channels`, {
+          query: {
+            include: 'state,connected,location,iodevice,supportedFunctions',
+          },
+          retryOnUnauthorized: true,
+          includeAuth: true,
+          retryOnTransient: true,
+          maxRetries: 3,
+        });
+      }
+    }
 
     if (!Array.isArray(payload)) {
       throw new Error('Unexpected channels response from SUPLA cloud.');
@@ -102,6 +140,45 @@ export class SuplaApiClient {
     }
 
     return channels;
+  }
+
+  async listChannelStates(): Promise<SuplaChannelStateSnapshot[]> {
+    const payload = await this.requestUnknown('GET', `${this.apiPrefix}/channels/states`, {
+      retryOnUnauthorized: true,
+      includeAuth: true,
+      retryOnTransient: true,
+      maxRetries: 3,
+    });
+
+    if (!Array.isArray(payload)) {
+      throw new Error('Unexpected channel states response from SUPLA cloud.');
+    }
+
+    const snapshots: SuplaChannelStateSnapshot[] = [];
+    for (const item of payload) {
+      if (!item || typeof item !== 'object') {
+        continue;
+      }
+
+      const record = item as Record<string, unknown>;
+      const rawId = asNumber(record.id);
+      if (rawId === undefined) {
+        continue;
+      }
+
+      const id = Math.trunc(rawId);
+      const state = record.state && typeof record.state === 'object'
+        ? (record.state as SuplaChannelState)
+        : undefined;
+
+      snapshots.push({
+        id,
+        connected: typeof record.connected === 'boolean' ? record.connected : undefined,
+        state,
+      });
+    }
+
+    return snapshots;
   }
 
   async executeChannelAction(channelId: number, payload: Record<string, unknown>): Promise<void> {

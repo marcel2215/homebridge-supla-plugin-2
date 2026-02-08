@@ -3,6 +3,7 @@ import type { CharacteristicValue, PlatformAccessory, Service } from 'homebridge
 import {
   SUPLA_ACTION,
   SUPLA_FUNCTION,
+  isCctFunction,
   isDigiglassFunction,
   isDimmerFunction,
   isGarageDoorFunction,
@@ -24,13 +25,32 @@ import {
   asBoolean,
   asNumber,
   clampNumber,
+  estimateColorTemperatureKelvin,
   hsvToRgb,
+  kelvinToMired,
+  kelvinToRgb,
+  miredToKelvin,
   parseHexColor,
   rgbToHsv,
 } from './utils.js';
 
 const WINDOW_POSITION_TOLERANCE = 2;
 const TILT_ANGLE_TOLERANCE = 2;
+const DEFAULT_COLOR_TEMPERATURE_MIREDS = 300;
+const MIN_HOMEKIT_COLOR_TEMPERATURE_MIREDS = 140;
+const MAX_HOMEKIT_COLOR_TEMPERATURE_MIREDS = 500;
+const GATE_MOVEMENT_TIMEOUT_MS = 45_000;
+
+interface PendingDoorMovement {
+  expectedOpen: boolean;
+  startedAt: number;
+}
+
+interface TiltCalibration {
+  tilt0Angle: number;
+  tilt100Angle: number;
+  controlType: string;
+}
 
 export class SuplaChannelAccessory {
   public readonly serviceKind: ServiceKind;
@@ -51,7 +71,12 @@ export class SuplaChannelAccessory {
   private cachedSaturation = 0;
   private cachedBrightness = 100;
   private cachedColorBrightness = 100;
+  private cachedColorTemperatureMired = DEFAULT_COLOR_TEMPERATURE_MIREDS;
+  private cachedThermostatHeatSetpoint = 21;
+  private cachedThermostatCoolSetpoint = 24;
   private lastConnectionState: boolean | undefined;
+  private pendingDoorMovement: PendingDoorMovement | undefined;
+  private toggleWithoutSensorsWarningLogged = false;
 
   constructor(
     private readonly platform: SuplaHomebridgePlatform,
@@ -88,67 +113,73 @@ export class SuplaChannelAccessory {
       `SUPLA channel ${channel.id} state update: service=${this.serviceKind}, connected=${connected}, `
       + `on=${String(state.on)}, hi=${String(state.hi)}, shut=${String(state.shut)}`,
     );
-
-    switch (this.serviceKind) {
-    case 'outlet':
-      this.updateOutletState(state);
-      break;
-    case 'switch':
-      this.updateSwitchState(state);
-      break;
-    case 'fan':
-      this.updateFanState(state);
-      break;
-    case 'light':
-      this.updateLightState(state);
-      break;
-    case 'window':
-      this.updateWindowState(state);
-      break;
-    case 'windowCovering':
-      this.updateWindowCoveringState(state);
-      break;
-    case 'garageDoor':
-      this.updateGarageDoorState(state);
-      break;
-    case 'lock':
-      this.updateLockState(state);
-      break;
-    case 'temperature':
-      this.updateTemperatureState(this.mainService, state);
-      break;
-    case 'humidity':
-      this.updateHumidityState(this.mainService, state);
-      break;
-    case 'temperatureHumidity':
-      this.updateTemperatureHumidityState(state);
-      break;
-    case 'contact':
-      this.updateContactState(state);
-      break;
-    case 'occupancy':
-      this.updateOccupancyState(state);
-      break;
-    case 'leak':
-      this.updateLeakState(state);
-      break;
-    case 'motion':
-      this.updateMotionState(state);
-      break;
-    case 'thermostat':
-      this.updateThermostatState(state);
-      break;
-    case 'humidifierDehumidifier':
-      this.updateHumidifierDehumidifierState(state);
-      break;
-    case 'heaterCooler':
-      this.updateHeaterCoolerState(state);
-      break;
-    case 'valve':
-      this.updateValveState(state);
-      break;
-    default:
-      break;
+    try {
+      switch (this.serviceKind) {
+      case 'outlet':
+        this.updateOutletState(state);
+        break;
+      case 'switch':
+        this.updateSwitchState(state);
+        break;
+      case 'fan':
+        this.updateFanState(state);
+        break;
+      case 'light':
+        this.updateLightState(state);
+        break;
+      case 'window':
+        this.updateWindowState(state);
+        break;
+      case 'windowCovering':
+        this.updateWindowCoveringState(state);
+        break;
+      case 'garageDoor':
+        this.updateGarageDoorState(state);
+        break;
+      case 'lock':
+        this.updateLockState(state);
+        break;
+      case 'temperature':
+        this.updateTemperatureState(this.mainService, state);
+        break;
+      case 'humidity':
+        this.updateHumidityState(this.mainService, state);
+        break;
+      case 'temperatureHumidity':
+        this.updateTemperatureHumidityState(state);
+        break;
+      case 'contact':
+        this.updateContactState(state);
+        break;
+      case 'occupancy':
+        this.updateOccupancyState(state);
+        break;
+      case 'leak':
+        this.updateLeakState(state);
+        break;
+      case 'motion':
+        this.updateMotionState(state);
+        break;
+      case 'thermostat':
+        this.updateThermostatState(state);
+        break;
+      case 'humidifierDehumidifier':
+        this.updateHumidifierDehumidifierState(state);
+        break;
+      case 'heaterCooler':
+        this.updateHeaterCoolerState(state);
+        break;
+      case 'valve':
+        this.updateValveState(state);
+        break;
+      default:
+        break;
+      }
+    } catch (error) {
+      const errorText = error instanceof Error ? error.message : String(error);
+      this.platform.log.error(
+        `SUPLA channel ${channel.id}: failed to update HomeKit state for ${this.serviceKind}: ${errorText}`,
+      );
     }
   }
 
@@ -184,18 +215,31 @@ export class SuplaChannelAccessory {
     }
     case 'light': {
       const service = this.accessory.addService(this.platform.Service.Lightbulb, displayName);
+      const functionId = getChannelFunctionId(this.channel);
+      const supportsRgb = isRgbFunction(functionId);
+      const supportsCct = isCctFunction(functionId);
+
       service.getCharacteristic(this.platform.Characteristic.On)
         .onSet(this.handleLightOnSet.bind(this));
 
       service.getCharacteristic(this.platform.Characteristic.Brightness)
         .onSet(this.handleLightBrightnessSet.bind(this));
 
-      if (isRgbFunction(getChannelFunctionId(this.channel))) {
+      if (supportsRgb) {
         service.getCharacteristic(this.platform.Characteristic.Hue)
           .onSet(this.handleLightHueSet.bind(this));
 
         service.getCharacteristic(this.platform.Characteristic.Saturation)
           .onSet(this.handleLightSaturationSet.bind(this));
+      }
+
+      if (supportsCct) {
+        service.getCharacteristic(this.platform.Characteristic.ColorTemperature)
+          .setProps({
+            minValue: MIN_HOMEKIT_COLOR_TEMPERATURE_MIREDS,
+            maxValue: MAX_HOMEKIT_COLOR_TEMPERATURE_MIREDS,
+          })
+          .onSet(this.handleLightColorTemperatureSet.bind(this));
       }
 
       return { main: service };
@@ -277,13 +321,36 @@ export class SuplaChannelAccessory {
       service.getCharacteristic(this.platform.Characteristic.TargetHeatingCoolingState)
         .onSet(this.handleThermostatModeSet.bind(this));
 
+      const temperatureProps = this.readTemperatureRangeFromConfig(5, 35);
       service.getCharacteristic(this.platform.Characteristic.TargetTemperature)
         .onSet(this.handleThermostatTargetTemperatureSet.bind(this))
         .setProps({
-          minValue: 5,
-          maxValue: 35,
+          minValue: temperatureProps.minValue,
+          maxValue: temperatureProps.maxValue,
           minStep: 0.5,
         });
+
+      service.getCharacteristic(this.platform.Characteristic.HeatingThresholdTemperature)
+        .onSet(this.handleThermostatHeatingThresholdTemperatureSet.bind(this))
+        .setProps({
+          minValue: temperatureProps.minValue,
+          maxValue: temperatureProps.maxValue,
+          minStep: 0.5,
+        });
+
+      service.getCharacteristic(this.platform.Characteristic.CoolingThresholdTemperature)
+        .onSet(this.handleThermostatCoolingThresholdTemperatureSet.bind(this))
+        .setProps({
+          minValue: temperatureProps.minValue,
+          maxValue: temperatureProps.maxValue,
+          minStep: 0.5,
+        });
+
+      service.getCharacteristic(this.platform.Characteristic.TemperatureDisplayUnits)
+        .setProps({
+          validValues: [this.platform.Characteristic.TemperatureDisplayUnits.CELSIUS],
+        })
+        .updateValue(this.platform.Characteristic.TemperatureDisplayUnits.CELSIUS);
 
       return { main: service };
     }
@@ -306,13 +373,29 @@ export class SuplaChannelAccessory {
           validValues: [this.platform.Characteristic.TargetHeaterCoolerState.HEAT],
         })
         .onSet(this.handleHeaterCoolerTargetStateSet.bind(this));
+
+      const temperatureProps = this.readTemperatureRangeFromConfig(5, 60);
       service.getCharacteristic(this.platform.Characteristic.HeatingThresholdTemperature)
         .onSet(this.handleHeaterCoolerTargetTemperatureSet.bind(this))
         .setProps({
-          minValue: 5,
-          maxValue: 60,
+          minValue: temperatureProps.minValue,
+          maxValue: temperatureProps.maxValue,
           minStep: 0.5,
         });
+
+      service.getCharacteristic(this.platform.Characteristic.CoolingThresholdTemperature)
+        .onSet(this.handleHeaterCoolerCoolingThresholdTemperatureSet.bind(this))
+        .setProps({
+          minValue: temperatureProps.minValue,
+          maxValue: temperatureProps.maxValue,
+          minStep: 0.5,
+        });
+
+      service.getCharacteristic(this.platform.Characteristic.TemperatureDisplayUnits)
+        .setProps({
+          validValues: [this.platform.Characteristic.TemperatureDisplayUnits.CELSIUS],
+        })
+        .updateValue(this.platform.Characteristic.TemperatureDisplayUnits.CELSIUS);
       return { main: service };
     }
     case 'valve': {
@@ -379,17 +462,26 @@ export class SuplaChannelAccessory {
 
   private updateLightState(state: SuplaChannelState): void {
     const functionId = getChannelFunctionId(this.channel);
+    const supportsDimmer = isDimmerFunction(functionId);
+    const supportsRgb = isRgbFunction(functionId);
+    const supportsCct = isCctFunction(functionId);
 
-    if (isDimmerFunction(functionId)) {
+    if (supportsDimmer) {
       const brightness = clampNumber(asNumber(state.brightness) ?? this.cachedBrightness, 0, 100);
       this.cachedBrightness = brightness;
       this.mainService.updateCharacteristic(this.platform.Characteristic.Brightness, brightness);
     }
 
-    if (isRgbFunction(functionId)) {
-      const colorBrightness = clampNumber(asNumber(state.color_brightness) ?? this.cachedColorBrightness, 0, 100);
-      this.cachedColorBrightness = colorBrightness;
+    const colorBrightnessFromState = asNumber(state.color_brightness)
+      ?? asNumber(state.colorBrightness);
 
+    if (supportsRgb || supportsCct) {
+      const colorBrightness = clampNumber(colorBrightnessFromState ?? this.cachedColorBrightness, 0, 100);
+      this.cachedColorBrightness = colorBrightness;
+    }
+
+    if (supportsRgb) {
+      const colorBrightness = this.cachedColorBrightness;
       const hsv = this.readHsv(state, colorBrightness);
       if (hsv) {
         this.cachedHue = hsv.hue;
@@ -401,6 +493,14 @@ export class SuplaChannelAccessory {
         if (!isDimmerFunction(functionId)) {
           this.mainService.updateCharacteristic(this.platform.Characteristic.Brightness, colorBrightness);
         }
+      }
+    }
+
+    if (supportsCct) {
+      const colorTemperatureMired = this.readColorTemperatureMired(state);
+      if (colorTemperatureMired !== undefined) {
+        this.cachedColorTemperatureMired = colorTemperatureMired;
+        this.mainService.updateCharacteristic(this.platform.Characteristic.ColorTemperature, colorTemperatureMired);
       }
     }
 
@@ -425,7 +525,9 @@ export class SuplaChannelAccessory {
     this.mainService.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, currentDoorState);
     this.mainService.updateCharacteristic(this.platform.Characteristic.TargetDoorState, targetDoorState);
 
-    const obstruction = asBoolean(state.motorProblem) ?? false;
+    const obstruction = (asBoolean(state.motorProblem) ?? false)
+      || (asBoolean(state.notCalibrated) ?? false)
+      || (asBoolean(state.calibrationError) ?? false);
     this.mainService.updateCharacteristic(this.platform.Characteristic.ObstructionDetected, obstruction);
   }
 
@@ -533,18 +635,42 @@ export class SuplaChannelAccessory {
   }
 
   private updateThermostatState(state: SuplaChannelState): void {
+    const temperatureRange = this.readTemperatureRangeFromConfig(5, 35);
     const currentTemperature = asNumber(state.temperatureMain)
       ?? asNumber(state.temperature)
       ?? 20;
 
-    const targetTemperature = asNumber(state.temperatureHeat)
-      ?? asNumber(state.temperatureCool)
-      ?? currentTemperature;
+    const heatSetpoint = asNumber(state.temperatureHeat);
+    const coolSetpoint = asNumber(state.temperatureCool);
+    if (heatSetpoint !== undefined) {
+      this.cachedThermostatHeatSetpoint = clampNumber(heatSetpoint, temperatureRange.minValue, temperatureRange.maxValue);
+    }
+    if (coolSetpoint !== undefined) {
+      this.cachedThermostatCoolSetpoint = clampNumber(coolSetpoint, temperatureRange.minValue, temperatureRange.maxValue);
+    }
 
     const currentMode = this.readCurrentThermostatMode(state);
-    const targetMode = this.readTargetThermostatMode(state);
+    const targetMode = this.normalizeThermostatTargetMode(this.readTargetThermostatMode(state));
+    const targetTemperature = this.resolveThermostatTargetTemperature(targetMode, currentTemperature);
+    const targetHumidity = asNumber(state.humidityMain)
+      ?? asNumber(state.humidity);
+    const heatingThreshold = clampNumber(
+      heatSetpoint ?? this.cachedThermostatHeatSetpoint,
+      temperatureRange.minValue,
+      temperatureRange.maxValue,
+    );
+    const coolingThreshold = clampNumber(
+      coolSetpoint ?? this.cachedThermostatCoolSetpoint,
+      temperatureRange.minValue,
+      temperatureRange.maxValue,
+    );
 
     this.targetThermostatMode = targetMode;
+
+    this.mainService.getCharacteristic(this.platform.Characteristic.TargetHeatingCoolingState)
+      .setProps({
+        validValues: this.readAllowedThermostatTargetModes(),
+      });
 
     this.mainService.updateCharacteristic(
       this.platform.Characteristic.CurrentTemperature,
@@ -553,7 +679,7 @@ export class SuplaChannelAccessory {
 
     this.mainService.updateCharacteristic(
       this.platform.Characteristic.TargetTemperature,
-      clampNumber(targetTemperature, 5, 35),
+      clampNumber(targetTemperature, temperatureRange.minValue, temperatureRange.maxValue),
     );
 
     this.mainService.updateCharacteristic(
@@ -565,6 +691,28 @@ export class SuplaChannelAccessory {
       this.platform.Characteristic.TargetHeatingCoolingState,
       targetMode,
     );
+
+    this.mainService.updateCharacteristic(
+      this.platform.Characteristic.HeatingThresholdTemperature,
+      heatingThreshold,
+    );
+
+    this.mainService.updateCharacteristic(
+      this.platform.Characteristic.CoolingThresholdTemperature,
+      coolingThreshold,
+    );
+
+    this.mainService.updateCharacteristic(
+      this.platform.Characteristic.TemperatureDisplayUnits,
+      this.platform.Characteristic.TemperatureDisplayUnits.CELSIUS,
+    );
+
+    if (targetHumidity !== undefined) {
+      this.mainService.updateCharacteristic(
+        this.platform.Characteristic.CurrentRelativeHumidity,
+        clampNumber(targetHumidity, 0, 100),
+      );
+    }
   }
 
   private updateHumidifierDehumidifierState(state: SuplaChannelState): void {
@@ -600,16 +748,44 @@ export class SuplaChannelAccessory {
 
   private updateHeaterCoolerState(state: SuplaChannelState): void {
     const active = this.readOnState(state);
+    const temperatureRange = this.readTemperatureRangeFromConfig(5, 60);
     const currentTemperature = asNumber(state.temperatureMain)
       ?? asNumber(state.temperature)
       ?? 20;
-    const targetTemperature = asNumber(state.temperatureHeat)
-      ?? asNumber(state.temperatureCool)
+    const currentHumidity = asNumber(state.humidityMain)
+      ?? asNumber(state.humidity);
+    const stateHeatSetpoint = asNumber(state.temperatureHeat);
+    const stateCoolSetpoint = asNumber(state.temperatureCool);
+    if (stateHeatSetpoint !== undefined) {
+      this.cachedThermostatHeatSetpoint = clampNumber(
+        stateHeatSetpoint,
+        temperatureRange.minValue,
+        temperatureRange.maxValue,
+      );
+    }
+    if (stateCoolSetpoint !== undefined) {
+      this.cachedThermostatCoolSetpoint = clampNumber(
+        stateCoolSetpoint,
+        temperatureRange.minValue,
+        temperatureRange.maxValue,
+      );
+    }
+
+    const targetHeatTemperature = stateHeatSetpoint
+      ?? this.cachedThermostatHeatSetpoint
       ?? currentTemperature;
+    const targetCoolTemperature = stateCoolSetpoint
+      ?? this.cachedThermostatCoolSetpoint
+      ?? targetHeatTemperature;
 
     const currentState = this.readCurrentHeaterCoolerState(state, active);
-    const targetState = this.readTargetHeaterCoolerState(state);
+    const targetState = this.normalizeHeaterCoolerTargetState(this.readTargetHeaterCoolerState(state));
     this.targetHeaterCoolerState = targetState;
+
+    this.mainService.getCharacteristic(this.platform.Characteristic.TargetHeaterCoolerState)
+      .setProps({
+        validValues: this.readAllowedHeaterCoolerTargetStates(),
+      });
 
     this.mainService.updateCharacteristic(
       this.platform.Characteristic.Active,
@@ -635,12 +811,32 @@ export class SuplaChannelAccessory {
 
     this.mainService.updateCharacteristic(
       this.platform.Characteristic.HeatingThresholdTemperature,
-      clampNumber(targetTemperature, 5, 60),
+      clampNumber(targetHeatTemperature, temperatureRange.minValue, temperatureRange.maxValue),
     );
+
+    this.mainService.updateCharacteristic(
+      this.platform.Characteristic.CoolingThresholdTemperature,
+      clampNumber(targetCoolTemperature, temperatureRange.minValue, temperatureRange.maxValue),
+    );
+
+    this.mainService.updateCharacteristic(
+      this.platform.Characteristic.TemperatureDisplayUnits,
+      this.platform.Characteristic.TemperatureDisplayUnits.CELSIUS,
+    );
+
+    if (currentHumidity !== undefined) {
+      this.updateIfPresent(
+        this.mainService,
+        this.platform.Characteristic.CurrentRelativeHumidity,
+        clampNumber(currentHumidity, 0, 100),
+      );
+    }
   }
 
   private updateValveState(state: SuplaChannelState): void {
     const active = this.readValveActiveState(state);
+    const remainingSeconds = asNumber(state.millisecondsToEnd);
+    const elapsedSeconds = asNumber(state.millisecondsFromStart);
 
     this.mainService.updateCharacteristic(
       this.platform.Characteristic.Active,
@@ -655,6 +851,27 @@ export class SuplaChannelAccessory {
         ? this.platform.Characteristic.InUse.IN_USE
         : this.platform.Characteristic.InUse.NOT_IN_USE,
     );
+
+    if (remainingSeconds !== undefined && remainingSeconds >= 0) {
+      this.updateIfPresent(
+        this.mainService,
+        this.platform.Characteristic.RemainingDuration,
+        Math.round(remainingSeconds / 1000),
+      );
+    }
+
+    if (
+      remainingSeconds !== undefined
+      && remainingSeconds >= 0
+      && elapsedSeconds !== undefined
+      && elapsedSeconds >= 0
+    ) {
+      this.updateIfPresent(
+        this.mainService,
+        this.platform.Characteristic.SetDuration,
+        Math.round((remainingSeconds + elapsedSeconds) / 1000),
+      );
+    }
   }
 
   private async handleSwitchSet(value: CharacteristicValue): Promise<void> {
@@ -674,6 +891,13 @@ export class SuplaChannelAccessory {
 
   private async handleLightOnSet(value: CharacteristicValue): Promise<void> {
     const on = Boolean(value);
+    const functionId = getChannelFunctionId(this.channel);
+
+    if (isDimmerFunction(functionId) || isRgbFunction(functionId) || isCctFunction(functionId)) {
+      await this.executeAction(this.buildLightPowerPayload(on, functionId));
+      return;
+    }
+
     await this.executeAction({ action: on ? SUPLA_ACTION.TURN_ON : SUPLA_ACTION.TURN_OFF });
   }
 
@@ -710,6 +934,38 @@ export class SuplaChannelAccessory {
     await this.sendRgbColorUpdate();
   }
 
+  private async handleLightColorTemperatureSet(value: CharacteristicValue): Promise<void> {
+    const functionId = getChannelFunctionId(this.channel);
+    if (!isCctFunction(functionId)) {
+      return;
+    }
+
+    const colorTemperatureMired = clampNumber(
+      Number(value),
+      MIN_HOMEKIT_COLOR_TEMPERATURE_MIREDS,
+      MAX_HOMEKIT_COLOR_TEMPERATURE_MIREDS,
+    );
+    this.cachedColorTemperatureMired = colorTemperatureMired;
+
+    const kelvin = miredToKelvin(colorTemperatureMired);
+    const rgb = kelvinToRgb(kelvin);
+    const hsv = rgbToHsv(rgb.red, rgb.green, rgb.blue);
+    this.cachedHue = hsv.hue;
+    this.cachedSaturation = hsv.saturation;
+    if (isRgbFunction(functionId)) {
+      this.mainService.updateCharacteristic(this.platform.Characteristic.Hue, hsv.hue);
+      this.mainService.updateCharacteristic(this.platform.Characteristic.Saturation, hsv.saturation);
+    }
+
+    const colorBrightness = clampNumber(this.cachedColorBrightness, 0, 100);
+    await this.executeAction({
+      action: SUPLA_ACTION.SET_RGBW_PARAMETERS,
+      hue: Math.round(hsv.hue),
+      color_brightness: Math.round(colorBrightness),
+      turnOnOff: true,
+    });
+  }
+
   private async sendRgbColorUpdate(): Promise<void> {
     const brightness = clampNumber(this.cachedColorBrightness, 0, 100);
 
@@ -722,6 +978,49 @@ export class SuplaChannelAccessory {
       },
       turnOnOff: true,
     });
+  }
+
+  private buildLightPowerPayload(on: boolean, functionId: number): Record<string, unknown> {
+    const payload: Record<string, unknown> = {
+      action: SUPLA_ACTION.SET_RGBW_PARAMETERS,
+      turnOnOff: true,
+    };
+
+    if (isDimmerFunction(functionId)) {
+      const brightness = on
+        ? Math.max(1, Math.round(clampNumber(this.cachedBrightness, 0, 100)))
+        : 0;
+      payload.brightness = brightness;
+    }
+
+    if (isRgbFunction(functionId)) {
+      const colorBrightness = on
+        ? Math.max(1, Math.round(clampNumber(this.cachedColorBrightness, 0, 100)))
+        : 0;
+      payload.hsv = {
+        hue: Math.round(clampNumber(this.cachedHue, 0, 360)),
+        saturation: Math.round(clampNumber(this.cachedSaturation, 0, 100)),
+        value: colorBrightness,
+      };
+      return payload;
+    }
+
+    if (isCctFunction(functionId) && on) {
+      const rgb = kelvinToRgb(miredToKelvin(this.cachedColorTemperatureMired));
+      const hsv = rgbToHsv(rgb.red, rgb.green, rgb.blue);
+      this.cachedHue = hsv.hue;
+      this.cachedSaturation = hsv.saturation;
+    }
+
+    if (isCctFunction(functionId)) {
+      const colorBrightness = on
+        ? Math.max(1, Math.round(clampNumber(this.cachedColorBrightness, 0, 100)))
+        : 0;
+      payload.hue = Math.round(clampNumber(this.cachedHue, 0, 360));
+      payload.color_brightness = colorBrightness;
+    }
+
+    return payload;
   }
 
   private async handleWindowTargetPositionSet(value: CharacteristicValue): Promise<void> {
@@ -759,11 +1058,18 @@ export class SuplaChannelAccessory {
 
     const angle = clampNumber(Number(value), -90, 90);
     this.targetTiltAngle = angle;
-
-    await this.executeAction({
+    const calibration = this.readTiltCalibration();
+    const tiltPercent = Math.round(this.tiltPercentFromAngle(angle, calibration));
+    const payload: Record<string, unknown> = {
       action: SUPLA_ACTION.SHUT_PARTIALLY,
-      tilt: Math.round(this.tiltPercentFromAngle(angle)),
-    });
+      tilt: tiltPercent,
+    };
+
+    if (this.isTiltsOnlyWhenFullyClosed(calibration.controlType)) {
+      payload.percentage = 100;
+    }
+
+    await this.executeAction(payload);
   }
 
   private async handleDigiglassTargetPositionSet(target: number): Promise<void> {
@@ -799,6 +1105,7 @@ export class SuplaChannelAccessory {
       await this.executeAction({
         action: openRequested ? SUPLA_ACTION.REVEAL : SUPLA_ACTION.SHUT,
       });
+      this.setPendingDoorMovement(openRequested);
       return;
     }
 
@@ -806,11 +1113,21 @@ export class SuplaChannelAccessory {
       functionId === SUPLA_FUNCTION.CONTROLLING_THE_GATE
       || functionId === SUPLA_FUNCTION.CONTROLLING_THE_GARAGE_DOOR
     ) {
+      const hasSensors = this.hasGateSensorConfiguration();
+      if (!hasSensors && !this.toggleWithoutSensorsWarningLogged) {
+        this.toggleWithoutSensorsWarningLogged = true;
+        this.platform.log.warn(
+          `SUPLA channel ${this.channel.id}: gate controller has no opening sensor configured. `
+          + 'Open/Close commands may toggle unexpectedly until sensor state is available.',
+        );
+      }
+
       const currentDoorState = this.readGarageCurrentDoorState(state);
       const alreadyInRequestedState = openRequested
         ? currentDoorState === this.platform.Characteristic.CurrentDoorState.OPEN
         : currentDoorState === this.platform.Characteristic.CurrentDoorState.CLOSED;
       if (alreadyInRequestedState) {
+        this.clearPendingDoorMovement('already in requested state');
         this.platform.log.debug(
           `SUPLA channel ${this.channel.id}: gate/garage already ${
             openRequested ? 'open' : 'closed'
@@ -819,14 +1136,25 @@ export class SuplaChannelAccessory {
         return;
       }
 
-      await this.executeAction({
-        action: SUPLA_ACTION.OPEN_CLOSE,
-      });
+      const directAction = openRequested ? SUPLA_ACTION.OPEN : SUPLA_ACTION.CLOSE;
+      const canUseDirectAction = this.isActionAdvertised(directAction);
+      const canUseToggleAction = this.isActionAdvertised(SUPLA_ACTION.OPEN_CLOSE);
+      const action = canUseDirectAction && (hasSensors || !canUseToggleAction)
+        ? directAction
+        : (canUseToggleAction ? SUPLA_ACTION.OPEN_CLOSE : directAction);
+
+      this.platform.log.debug(
+        `SUPLA channel ${this.channel.id}: gate action strategy requested=${openRequested ? 'OPEN' : 'CLOSE'}, `
+        + `selected=${action}, directAdvertised=${canUseDirectAction}, toggleAdvertised=${canUseToggleAction}, hasSensors=${hasSensors}.`,
+      );
+      await this.executeAction({ action });
+      this.setPendingDoorMovement(openRequested);
       return;
     }
 
     if (isGarageDoorFunction(functionId)) {
       await this.executeAction({ action: openRequested ? SUPLA_ACTION.OPEN : SUPLA_ACTION.CLOSE });
+      this.setPendingDoorMovement(openRequested);
     }
   }
 
@@ -839,8 +1167,15 @@ export class SuplaChannelAccessory {
   }
 
   private async handleThermostatModeSet(value: CharacteristicValue): Promise<void> {
-    const mode = Number(value);
+    const requestedMode = Number(value);
+    const mode = this.normalizeThermostatTargetMode(requestedMode);
     this.targetThermostatMode = mode;
+
+    if (mode !== requestedMode) {
+      this.platform.log.warn(
+        `SUPLA channel ${this.channel.id}: thermostat mode ${requestedMode} is not allowed, using ${mode}.`,
+      );
+    }
 
     if (mode === this.platform.Characteristic.TargetHeatingCoolingState.OFF) {
       await this.executeAction({ action: SUPLA_ACTION.TURN_OFF });
@@ -863,43 +1198,152 @@ export class SuplaChannelAccessory {
       });
     }
 
-    await this.executeAction({ action: SUPLA_ACTION.TURN_ON });
+    if (this.isActionAdvertised(SUPLA_ACTION.TURN_ON)) {
+      await this.executeAction({ action: SUPLA_ACTION.TURN_ON });
+    } else {
+      this.platform.log.debug(
+        `SUPLA channel ${this.channel.id}: skipping TURN_ON after HVAC_SET_PARAMETERS because TURN_ON is not advertised.`,
+      );
+    }
   }
 
   private async handleThermostatTargetTemperatureSet(value: CharacteristicValue): Promise<void> {
-    const temperature = clampNumber(Number(value), 5, 35);
+    const temperatureRange = this.readTemperatureRangeFromConfig(5, 35);
+    const temperature = clampNumber(Number(value), temperatureRange.minValue, temperatureRange.maxValue);
     const functionId = getChannelFunctionId(this.channel);
-    const targetMode = this.targetThermostatMode
-      ?? this.platform.Characteristic.TargetHeatingCoolingState.HEAT;
+    const targetMode = this.normalizeThermostatTargetMode(
+      this.targetThermostatMode ?? this.platform.Characteristic.TargetHeatingCoolingState.HEAT,
+    );
 
     if (functionId === SUPLA_FUNCTION.HVAC_THERMOSTAT_HEAT_COOL) {
+      const offsetRange = this.readAutoOffsetRangeFromConfig();
       if (targetMode === this.platform.Characteristic.TargetHeatingCoolingState.COOL) {
+        const normalized = this.normalizeHeatCoolSetpoints(
+          this.cachedThermostatHeatSetpoint,
+          temperature,
+          temperatureRange,
+          offsetRange.minGap,
+          offsetRange.maxGap,
+          'cool',
+        );
+        this.cachedThermostatHeatSetpoint = normalized.heat;
+        this.cachedThermostatCoolSetpoint = normalized.cool;
         await this.executeAction({
           action: SUPLA_ACTION.HVAC_SET_TEMPERATURES,
-          temperatureCool: Number(temperature.toFixed(1)),
+          temperatureHeat: normalized.heat,
+          temperatureCool: normalized.cool,
         });
         return;
       }
 
       if (targetMode === this.platform.Characteristic.TargetHeatingCoolingState.AUTO) {
+        const currentGap = this.cachedThermostatCoolSetpoint - this.cachedThermostatHeatSetpoint;
+        const preferredGapBase = currentGap > 0 ? currentGap : offsetRange.minGap;
+        const preferredGap = offsetRange.maxGap !== undefined
+          ? clampNumber(preferredGapBase, offsetRange.minGap, offsetRange.maxGap)
+          : Math.max(offsetRange.minGap, preferredGapBase);
+        const normalized = this.normalizeHeatCoolSetpoints(
+          temperature - preferredGap / 2,
+          temperature + preferredGap / 2,
+          temperatureRange,
+          offsetRange.minGap,
+          offsetRange.maxGap,
+          'center',
+        );
+        this.cachedThermostatHeatSetpoint = normalized.heat;
+        this.cachedThermostatCoolSetpoint = normalized.cool;
         await this.executeAction({
           action: SUPLA_ACTION.HVAC_SET_TEMPERATURES,
-          temperatureHeat: Number(temperature.toFixed(1)),
-          temperatureCool: Number((temperature + 1).toFixed(1)),
+          temperatureHeat: normalized.heat,
+          temperatureCool: normalized.cool,
         });
         return;
       }
 
+      const normalized = this.normalizeHeatCoolSetpoints(
+        temperature,
+        this.cachedThermostatCoolSetpoint,
+        temperatureRange,
+        offsetRange.minGap,
+        offsetRange.maxGap,
+        'heat',
+      );
+      this.cachedThermostatHeatSetpoint = normalized.heat;
+      this.cachedThermostatCoolSetpoint = normalized.cool;
       await this.executeAction({
         action: SUPLA_ACTION.HVAC_SET_TEMPERATURES,
-        temperatureHeat: Number(temperature.toFixed(1)),
+        temperatureHeat: normalized.heat,
+        temperatureCool: normalized.cool,
       });
       return;
     }
 
+    this.cachedThermostatHeatSetpoint = temperature;
     await this.executeAction({
       action: SUPLA_ACTION.HVAC_SET_TEMPERATURE,
       temperature: Number(temperature.toFixed(1)),
+    });
+  }
+
+  private async handleThermostatHeatingThresholdTemperatureSet(value: CharacteristicValue): Promise<void> {
+    const temperatureRange = this.readTemperatureRangeFromConfig(5, 35);
+    const temperature = clampNumber(Number(value), temperatureRange.minValue, temperatureRange.maxValue);
+
+    const functionId = getChannelFunctionId(this.channel);
+    if (functionId === SUPLA_FUNCTION.HVAC_THERMOSTAT_HEAT_COOL) {
+      const offsetRange = this.readAutoOffsetRangeFromConfig();
+      const normalized = this.normalizeHeatCoolSetpoints(
+        temperature,
+        this.cachedThermostatCoolSetpoint,
+        temperatureRange,
+        offsetRange.minGap,
+        offsetRange.maxGap,
+        'heat',
+      );
+      this.cachedThermostatHeatSetpoint = normalized.heat;
+      this.cachedThermostatCoolSetpoint = normalized.cool;
+      await this.executeAction({
+        action: SUPLA_ACTION.HVAC_SET_TEMPERATURES,
+        temperatureHeat: normalized.heat,
+        temperatureCool: normalized.cool,
+      });
+      return;
+    }
+
+    this.cachedThermostatHeatSetpoint = temperature;
+    await this.executeAction({
+      action: SUPLA_ACTION.HVAC_SET_TEMPERATURE,
+      temperature: Number(temperature.toFixed(1)),
+    });
+  }
+
+  private async handleThermostatCoolingThresholdTemperatureSet(value: CharacteristicValue): Promise<void> {
+    const temperatureRange = this.readTemperatureRangeFromConfig(5, 35);
+    const temperature = clampNumber(Number(value), temperatureRange.minValue, temperatureRange.maxValue);
+
+    if (getChannelFunctionId(this.channel) !== SUPLA_FUNCTION.HVAC_THERMOSTAT_HEAT_COOL) {
+      this.cachedThermostatCoolSetpoint = temperature;
+      this.platform.log.debug(
+        `SUPLA channel ${this.channel.id}: cooling threshold change ignored for non-heat-cool thermostat.`,
+      );
+      return;
+    }
+
+    const offsetRange = this.readAutoOffsetRangeFromConfig();
+    const normalized = this.normalizeHeatCoolSetpoints(
+      this.cachedThermostatHeatSetpoint,
+      temperature,
+      temperatureRange,
+      offsetRange.minGap,
+      offsetRange.maxGap,
+      'cool',
+    );
+    this.cachedThermostatHeatSetpoint = normalized.heat;
+    this.cachedThermostatCoolSetpoint = normalized.cool;
+    await this.executeAction({
+      action: SUPLA_ACTION.HVAC_SET_TEMPERATURES,
+      temperatureHeat: normalized.heat,
+      temperatureCool: normalized.cool,
     });
   }
 
@@ -914,8 +1358,15 @@ export class SuplaChannelAccessory {
   }
 
   private async handleHeaterCoolerTargetStateSet(value: CharacteristicValue): Promise<void> {
-    const targetState = Number(value);
+    const requestedState = Number(value);
+    const targetState = this.normalizeHeaterCoolerTargetState(requestedState);
     this.targetHeaterCoolerState = targetState;
+
+    if (targetState !== requestedState) {
+      this.platform.log.warn(
+        `SUPLA channel ${this.channel.id}: heater/cooler target state ${requestedState} is not allowed, using ${targetState}.`,
+      );
+    }
 
     let mode = 'HEAT';
     if (targetState === this.platform.Characteristic.TargetHeaterCoolerState.COOL) {
@@ -929,15 +1380,42 @@ export class SuplaChannelAccessory {
       mode,
     });
 
-    await this.executeAction({ action: SUPLA_ACTION.TURN_ON });
+    if (this.isActionAdvertised(SUPLA_ACTION.TURN_ON)) {
+      await this.executeAction({ action: SUPLA_ACTION.TURN_ON });
+    } else {
+      this.platform.log.debug(
+        `SUPLA channel ${this.channel.id}: skipping TURN_ON after HVAC_SET_PARAMETERS because TURN_ON is not advertised.`,
+      );
+    }
   }
 
   private async handleHeaterCoolerTargetTemperatureSet(value: CharacteristicValue): Promise<void> {
-    const temperature = clampNumber(Number(value), 5, 60);
+    const temperatureRange = this.readTemperatureRangeFromConfig(5, 60);
+    const temperature = clampNumber(Number(value), temperatureRange.minValue, temperatureRange.maxValue);
+    this.cachedThermostatHeatSetpoint = temperature;
     await this.executeAction({
       action: SUPLA_ACTION.HVAC_SET_TEMPERATURE,
       temperature: Number(temperature.toFixed(1)),
     });
+  }
+
+  private async handleHeaterCoolerCoolingThresholdTemperatureSet(value: CharacteristicValue): Promise<void> {
+    const temperatureRange = this.readTemperatureRangeFromConfig(5, 60);
+    const temperature = clampNumber(Number(value), temperatureRange.minValue, temperatureRange.maxValue);
+    this.cachedThermostatCoolSetpoint = temperature;
+
+    const functionId = getChannelFunctionId(this.channel);
+    if (functionId === SUPLA_FUNCTION.HVAC_THERMOSTAT_HEAT_COOL) {
+      await this.executeAction({
+        action: SUPLA_ACTION.HVAC_SET_TEMPERATURES,
+        temperatureCool: Number(temperature.toFixed(1)),
+      });
+      return;
+    }
+
+    this.platform.log.debug(
+      `SUPLA channel ${this.channel.id}: cooling threshold change ignored for heater/cooler function ${functionId}.`,
+    );
   }
 
   private async handleValveActiveSet(value: CharacteristicValue): Promise<void> {
@@ -949,6 +1427,21 @@ export class SuplaChannelAccessory {
   }
 
   private async executeAction(payload: Record<string, unknown>): Promise<void> {
+    const requestedAction = typeof payload.action === 'string'
+      ? payload.action.trim().toUpperCase()
+      : undefined;
+    if (requestedAction) {
+      const possibleActions = (this.channel.possibleActions ?? [])
+        .map((action) => String(action.name ?? action.caption ?? '').trim().toUpperCase())
+        .filter((value) => value.length > 0);
+
+      if (possibleActions.length > 0 && !possibleActions.includes(requestedAction)) {
+        this.platform.log.warn(
+          `SUPLA channel ${this.channel.id}: action ${requestedAction} not listed in possibleActions=[${possibleActions.join(', ')}]. Sending request anyway.`,
+        );
+      }
+    }
+
     const payloadText = this.serializeForLog(payload);
     this.platform.log.debug(`SUPLA action request channel ${this.channel.id}: ${payloadText}`);
 
@@ -964,6 +1457,18 @@ export class SuplaChannelAccessory {
     }
   }
 
+  private isActionAdvertised(actionName: string): boolean {
+    const possibleActions = (this.channel.possibleActions ?? [])
+      .map((action) => String(action.name ?? action.caption ?? '').trim().toUpperCase())
+      .filter((value) => value.length > 0);
+
+    if (possibleActions.length === 0) {
+      return true;
+    }
+
+    return possibleActions.includes(actionName.toUpperCase());
+  }
+
   private readOnState(state: SuplaChannelState): boolean {
     const explicit = asBoolean(state.on);
     if (explicit !== undefined) {
@@ -975,7 +1480,8 @@ export class SuplaChannelAccessory {
       return brightness > 0;
     }
 
-    const colorBrightness = asNumber(state.color_brightness);
+    const colorBrightness = asNumber(state.color_brightness)
+      ?? asNumber(state.colorBrightness);
     if (colorBrightness !== undefined) {
       return colorBrightness > 0;
     }
@@ -984,6 +1490,17 @@ export class SuplaChannelAccessory {
   }
 
   private readHsv(state: SuplaChannelState, fallbackBrightness: number): { hue: number; saturation: number } | undefined {
+    const stateRecord = state as Record<string, unknown>;
+    const directHue = asNumber(state.hue)
+      ?? asNumber(stateRecord.hue);
+    const directSaturation = asNumber(stateRecord.saturation);
+    if (directHue !== undefined && directSaturation !== undefined) {
+      return {
+        hue: clampNumber(directHue, 0, 360),
+        saturation: clampNumber(directSaturation, 0, 100),
+      };
+    }
+
     const hsv = state.hsv;
     const hueFromState = asNumber(hsv?.hue);
     const saturationFromState = asNumber(hsv?.saturation);
@@ -1008,9 +1525,10 @@ export class SuplaChannelAccessory {
 
     const parsedColor = parseHexColor(state.color);
     if (parsedColor) {
+      const parsedHsv = rgbToHsv(parsedColor.red, parsedColor.green, parsedColor.blue);
       const adjustedRgb = hsvToRgb(
-        rgbToHsv(parsedColor.red, parsedColor.green, parsedColor.blue).hue,
-        rgbToHsv(parsedColor.red, parsedColor.green, parsedColor.blue).saturation,
+        parsedHsv.hue,
+        parsedHsv.saturation,
         fallbackBrightness,
       );
 
@@ -1062,7 +1580,8 @@ export class SuplaChannelAccessory {
       return;
     }
 
-    const currentTiltAngle = this.tiltAngleFromPercent(tiltPercent);
+    const tiltCalibration = this.readTiltCalibration();
+    const currentTiltAngle = this.tiltAngleFromPercent(tiltPercent, tiltCalibration);
     if (
       this.targetTiltAngle !== undefined
       && Math.abs(this.targetTiltAngle - currentTiltAngle) <= TILT_ANGLE_TOLERANCE
@@ -1149,6 +1668,7 @@ export class SuplaChannelAccessory {
   }
 
   private readTiltPercent(state: SuplaChannelState): number | undefined {
+    const tiltCalibration = this.readTiltCalibration();
     const stateRecord = state as Record<string, unknown>;
     const tiltPercent = asNumber(state.tiltPercent)
       ?? asNumber(stateRecord.tilt_percent)
@@ -1160,18 +1680,40 @@ export class SuplaChannelAccessory {
     const tiltAngle = asNumber(state.tiltAngle)
       ?? asNumber(stateRecord.tilt_angle);
     if (tiltAngle !== undefined) {
+      const normalizedPercent = this.tiltPercentFromPhysicalAngle(tiltAngle, tiltCalibration);
+      if (normalizedPercent !== undefined) {
+        return normalizedPercent;
+      }
+
       return clampNumber((tiltAngle * 100) / 180, 0, 100);
     }
 
     return undefined;
   }
 
-  private tiltAngleFromPercent(tiltPercent: number): number {
-    return clampNumber(Math.round((tiltPercent * 180) / 100 - 90), -90, 90);
+  private tiltAngleFromPercent(tiltPercent: number, calibration: TiltCalibration): number {
+    const physicalAngle = calibration.tilt0Angle
+      + ((calibration.tilt100Angle - calibration.tilt0Angle) * tiltPercent / 100);
+    return clampNumber(Math.round(physicalAngle - 90), -90, 90);
   }
 
-  private tiltPercentFromAngle(angle: number): number {
+  private tiltPercentFromAngle(angle: number, calibration: TiltCalibration): number {
+    const physicalAngle = angle + 90;
+    const mapped = this.tiltPercentFromPhysicalAngle(physicalAngle, calibration);
+    if (mapped !== undefined) {
+      return mapped;
+    }
+
     return clampNumber(((angle + 90) * 100) / 180, 0, 100);
+  }
+
+  private tiltPercentFromPhysicalAngle(physicalAngle: number, calibration: TiltCalibration): number | undefined {
+    const delta = calibration.tilt100Angle - calibration.tilt0Angle;
+    if (Math.abs(delta) < 0.001) {
+      return undefined;
+    }
+
+    return clampNumber(((physicalAngle - calibration.tilt0Angle) * 100) / delta, 0, 100);
   }
 
   private openPercentFromState(state: SuplaChannelState): number | undefined {
@@ -1208,47 +1750,68 @@ export class SuplaChannelAccessory {
   }
 
   private readGarageCurrentDoorState(state: SuplaChannelState): number {
-    const openPercent = this.openPercentFromState(state);
-    if (openPercent !== undefined) {
-      if (openPercent <= 5) {
-        return this.platform.Characteristic.CurrentDoorState.CLOSED;
-      }
-
-      if (openPercent >= 95) {
-        return this.platform.Characteristic.CurrentDoorState.OPEN;
-      }
-
+    const physicalState = this.readGaragePhysicalState(state);
+    if (physicalState === 'open') {
+      this.clearPendingDoorMovement('state indicates open');
+      return this.platform.Characteristic.CurrentDoorState.OPEN;
+    }
+    if (physicalState === 'closed') {
+      this.clearPendingDoorMovement('state indicates closed');
+      return this.platform.Characteristic.CurrentDoorState.CLOSED;
+    }
+    if (physicalState === 'partial') {
       return this.platform.Characteristic.CurrentDoorState.STOPPED;
     }
 
-    const gateLikeState = this.readGateLikeState(state);
-    if (gateLikeState === 'open') {
-      return this.platform.Characteristic.CurrentDoorState.OPEN;
-    }
-    if (gateLikeState === 'closed') {
-      return this.platform.Characteristic.CurrentDoorState.CLOSED;
+    const pending = this.getPendingDoorMovement();
+    if (pending) {
+      return pending.expectedOpen
+        ? this.platform.Characteristic.CurrentDoorState.OPENING
+        : this.platform.Characteristic.CurrentDoorState.CLOSING;
     }
 
     return this.platform.Characteristic.CurrentDoorState.STOPPED;
   }
 
   private readGarageTargetDoorState(state: SuplaChannelState): number {
-    const openPercent = this.openPercentFromState(state);
-    if (openPercent !== undefined) {
-      return openPercent >= 50
+    const physicalState = this.readGaragePhysicalState(state);
+    if (physicalState === 'open') {
+      return this.platform.Characteristic.TargetDoorState.OPEN;
+    }
+    if (physicalState === 'closed') {
+      return this.platform.Characteristic.TargetDoorState.CLOSED;
+    }
+
+    const pending = this.getPendingDoorMovement();
+    if (pending) {
+      return pending.expectedOpen
         ? this.platform.Characteristic.TargetDoorState.OPEN
         : this.platform.Characteristic.TargetDoorState.CLOSED;
     }
 
-    const gateLikeState = this.readGateLikeState(state);
-    if (gateLikeState === 'open') {
-      return this.platform.Characteristic.TargetDoorState.OPEN;
-    }
-    if (gateLikeState === 'closed') {
-      return this.platform.Characteristic.TargetDoorState.CLOSED;
+    return this.targetDoorState ?? this.platform.Characteristic.TargetDoorState.CLOSED;
+  }
+
+  private readGaragePhysicalState(state: SuplaChannelState): 'open' | 'closed' | 'partial' | 'unknown' {
+    const openPercent = this.openPercentFromState(state);
+    if (openPercent !== undefined) {
+      if (openPercent <= 5) {
+        return 'closed';
+      }
+
+      if (openPercent >= 95) {
+        return 'open';
+      }
+
+      return 'partial';
     }
 
-    return this.targetDoorState ?? this.platform.Characteristic.TargetDoorState.CLOSED;
+    const gateLikeState = this.readGateLikeState(state);
+    if (gateLikeState) {
+      return gateLikeState;
+    }
+
+    return 'unknown';
   }
 
   private readUnlockedState(state: SuplaChannelState): boolean {
@@ -1387,7 +1950,9 @@ export class SuplaChannelAccessory {
     }
 
     const hi = asBoolean(state.hi);
-    const partialHi = asBoolean(state.partial_hi) ?? false;
+    const partialHi = asBoolean(state.partial_hi)
+      ?? asBoolean(state.partialHi)
+      ?? false;
 
     if (partialHi && hi === false) {
       return 'partial';
@@ -1403,6 +1968,578 @@ export class SuplaChannelAccessory {
     }
 
     return undefined;
+  }
+
+  private readColorTemperatureMired(state: SuplaChannelState): number | undefined {
+    const stateRecord = state as Record<string, unknown>;
+    const explicitColorTemperature = asNumber(stateRecord.colorTemperature)
+      ?? asNumber(stateRecord.color_temperature)
+      ?? asNumber(stateRecord.colorTemp)
+      ?? asNumber(stateRecord.color_temp);
+    if (explicitColorTemperature !== undefined) {
+      if (explicitColorTemperature >= MIN_HOMEKIT_COLOR_TEMPERATURE_MIREDS && explicitColorTemperature <= MAX_HOMEKIT_COLOR_TEMPERATURE_MIREDS) {
+        return clampNumber(
+          Math.round(explicitColorTemperature),
+          MIN_HOMEKIT_COLOR_TEMPERATURE_MIREDS,
+          MAX_HOMEKIT_COLOR_TEMPERATURE_MIREDS,
+        );
+      }
+
+      const asKelvin = explicitColorTemperature > 1000
+        ? explicitColorTemperature
+        : miredToKelvin(explicitColorTemperature);
+      return clampNumber(
+        kelvinToMired(asKelvin),
+        MIN_HOMEKIT_COLOR_TEMPERATURE_MIREDS,
+        MAX_HOMEKIT_COLOR_TEMPERATURE_MIREDS,
+      );
+    }
+
+    const hue = asNumber(state.hue)
+      ?? asNumber(state.hsv?.hue)
+      ?? asNumber(stateRecord.hue);
+    if (hue !== undefined) {
+      const normalizedHue = clampNumber(hue, 0, 359);
+      const coldKelvin = 6500;
+      const warmKelvin = 2000;
+      const kelvin = coldKelvin - (normalizedHue / 359) * (coldKelvin - warmKelvin);
+      return clampNumber(
+        kelvinToMired(kelvin),
+        MIN_HOMEKIT_COLOR_TEMPERATURE_MIREDS,
+        MAX_HOMEKIT_COLOR_TEMPERATURE_MIREDS,
+      );
+    }
+
+    const parsedColor = parseHexColor(state.color);
+    if (!parsedColor) {
+      return undefined;
+    }
+
+    const estimatedKelvin = estimateColorTemperatureKelvin(parsedColor.red, parsedColor.green, parsedColor.blue);
+    return clampNumber(
+      kelvinToMired(estimatedKelvin),
+      MIN_HOMEKIT_COLOR_TEMPERATURE_MIREDS,
+      MAX_HOMEKIT_COLOR_TEMPERATURE_MIREDS,
+    );
+  }
+
+  private readConfigRecord(): Record<string, unknown> {
+    const config = this.channel.config;
+    if (config && typeof config === 'object' && !Array.isArray(config)) {
+      return config as Record<string, unknown>;
+    }
+
+    return {};
+  }
+
+  private readTiltCalibration(): TiltCalibration {
+    const config = this.readConfigRecord();
+    const nestedConfig = this.asRecord(config.controllingTheFacadeBlind)
+      ?? this.asRecord(config.controlling_the_facade_blind);
+
+    const rawTilt0Angle = asNumber(config.tilt0Angle)
+      ?? asNumber(config.tilt0_angle)
+      ?? asNumber(nestedConfig?.tilt0Angle)
+      ?? asNumber(nestedConfig?.tilt0_angle)
+      ?? 0;
+    const rawTilt100Angle = asNumber(config.tilt100Angle)
+      ?? asNumber(config.tilt100_angle)
+      ?? asNumber(nestedConfig?.tilt100Angle)
+      ?? asNumber(nestedConfig?.tilt100_angle)
+      ?? 180;
+    const controlTypeValue = config.tiltControlType
+      ?? config.tilt_control_type
+      ?? nestedConfig?.tiltControlType
+      ?? nestedConfig?.tilt_control_type;
+
+    let tilt0Angle = clampNumber(rawTilt0Angle, 0, 360);
+    let tilt100Angle = clampNumber(rawTilt100Angle, 0, 360);
+    if (Math.abs(tilt100Angle - tilt0Angle) < 0.001) {
+      tilt0Angle = 0;
+      tilt100Angle = 180;
+    }
+
+    return {
+      tilt0Angle,
+      tilt100Angle,
+      controlType: typeof controlTypeValue === 'string' ? controlTypeValue : String(controlTypeValue ?? ''),
+    };
+  }
+
+  private isTiltsOnlyWhenFullyClosed(rawControlType: string): boolean {
+    const normalized = rawControlType.trim().toLowerCase().replace(/[_\-\s]/g, '');
+    return normalized === 'tiltsonlywhenfullyclosed' || normalized === '3';
+  }
+
+  private hasGateSensorConfiguration(): boolean {
+    const config = this.readConfigRecord();
+    const nestedConfig = this.asRecord(config.controllingTheGate)
+      ?? this.asRecord(config.controlling_the_gate)
+      ?? this.asRecord(config.controllingTheGarageDoor)
+      ?? this.asRecord(config.controlling_the_garage_door);
+    const openingSensorChannelId = asNumber(this.channel.param2)
+      ?? asNumber(config.openingSensorChannelId)
+      ?? asNumber(config.opening_sensor_channel_id)
+      ?? asNumber(nestedConfig?.openingSensorChannelId)
+      ?? asNumber(nestedConfig?.opening_sensor_channel_id);
+    const partialSensorChannelId = asNumber(this.channel.param3)
+      ?? asNumber(config.openingSensorSecondaryChannelId)
+      ?? asNumber(config.opening_sensor_secondary_channel_id)
+      ?? asNumber(nestedConfig?.openingSensorSecondaryChannelId)
+      ?? asNumber(nestedConfig?.opening_sensor_secondary_channel_id);
+
+    return (openingSensorChannelId ?? 0) > 0 || (partialSensorChannelId ?? 0) > 0;
+  }
+
+  private setPendingDoorMovement(expectedOpen: boolean): void {
+    this.pendingDoorMovement = {
+      expectedOpen,
+      startedAt: Date.now(),
+    };
+    this.platform.log.debug(
+      `SUPLA channel ${this.channel.id}: pending door movement set to ${expectedOpen ? 'open' : 'closed'}.`,
+    );
+  }
+
+  private getPendingDoorMovement(): PendingDoorMovement | undefined {
+    const pending = this.pendingDoorMovement;
+    if (!pending) {
+      return undefined;
+    }
+
+    if (Date.now() - pending.startedAt > GATE_MOVEMENT_TIMEOUT_MS) {
+      this.platform.log.warn(
+        `SUPLA channel ${this.channel.id}: pending door movement timed out after ${GATE_MOVEMENT_TIMEOUT_MS}ms.`,
+      );
+      this.pendingDoorMovement = undefined;
+      return undefined;
+    }
+
+    return pending;
+  }
+
+  private clearPendingDoorMovement(reason: string): void {
+    if (!this.pendingDoorMovement) {
+      return;
+    }
+
+    this.platform.log.debug(
+      `SUPLA channel ${this.channel.id}: clearing pending door movement (${reason}).`,
+    );
+    this.pendingDoorMovement = undefined;
+  }
+
+  private readTemperatureRangeFromConfig(defaultMin: number, defaultMax: number): { minValue: number; maxValue: number } {
+    const config = this.readConfigRecord();
+    const hvacConfig = this.readHvacConfigRecord(config);
+    const constraints = this.asRecord(config.temperatureConstraints)
+      ?? this.asRecord(config.temperature_constraints)
+      ?? this.asRecord(hvacConfig?.temperatureConstraints)
+      ?? this.asRecord(hvacConfig?.temperature_constraints);
+    const temperatures = this.asRecord(config.temperatures)
+      ?? this.asRecord(hvacConfig?.temperatures);
+    const controlType = config.temperatureControlType
+      ?? config.temperature_control_type
+      ?? hvacConfig?.temperatureControlType
+      ?? hvacConfig?.temperature_control_type;
+    const useAuxRange = this.isAuxTemperatureControlType(controlType);
+    const sources = [constraints, temperatures];
+
+    const minValue = useAuxRange
+      ? this.readNumberFromRecords(
+        sources,
+        'auxMin',
+        'aux_min',
+        'auxMinSetpoint',
+        'aux_min_setpoint',
+        'roomMin',
+        'room_min',
+      )
+      : this.readNumberFromRecords(
+        sources,
+        'roomMin',
+        'room_min',
+        'auxMin',
+        'aux_min',
+        'auxMinSetpoint',
+        'aux_min_setpoint',
+      );
+    const maxValue = useAuxRange
+      ? this.readNumberFromRecords(
+        sources,
+        'auxMax',
+        'aux_max',
+        'auxMaxSetpoint',
+        'aux_max_setpoint',
+        'roomMax',
+        'room_max',
+      )
+      : this.readNumberFromRecords(
+        sources,
+        'roomMax',
+        'room_max',
+        'auxMax',
+        'aux_max',
+        'auxMaxSetpoint',
+        'aux_max_setpoint',
+      );
+    const resolvedMin = minValue ?? defaultMin;
+    const resolvedMax = maxValue ?? defaultMax;
+
+    if (!Number.isFinite(resolvedMin) || !Number.isFinite(resolvedMax) || resolvedMin >= resolvedMax) {
+      return { minValue: defaultMin, maxValue: defaultMax };
+    }
+
+    const normalizedMin = clampNumber(resolvedMin, -50, 100);
+    const normalizedMax = clampNumber(resolvedMax, -50, 100);
+    if (normalizedMin >= normalizedMax) {
+      return { minValue: defaultMin, maxValue: defaultMax };
+    }
+
+    return {
+      minValue: normalizedMin,
+      maxValue: normalizedMax,
+    };
+  }
+
+  private readAllowedThermostatTargetModes(): number[] {
+    const config = this.readConfigRecord();
+    const hvacConfig = this.readHvacConfigRecord(config);
+    const functionId = getChannelFunctionId(this.channel);
+    const modeHint = String(this.channel.state?.mode ?? '').toUpperCase();
+    const subfunctionHint = this.readNormalizedHvacSubfunction(config, hvacConfig);
+    const heatAvailable = this.readBooleanFromRecords(
+      [config, hvacConfig],
+      'heatingModeAvailable',
+      'heating_mode_available',
+    );
+    const coolAvailable = this.readBooleanFromRecords(
+      [config, hvacConfig],
+      'coolingModeAvailable',
+      'cooling_mode_available',
+    );
+
+    let heatSupported: boolean;
+    let coolSupported: boolean;
+
+    if (heatAvailable !== undefined || coolAvailable !== undefined) {
+      heatSupported = heatAvailable ?? false;
+      coolSupported = coolAvailable ?? false;
+    } else if (functionId === SUPLA_FUNCTION.HVAC_THERMOSTAT_HEAT_COOL) {
+      heatSupported = true;
+      coolSupported = true;
+    } else if (functionId === SUPLA_FUNCTION.HVAC_THERMOSTAT) {
+      if (subfunctionHint === 'COOL') {
+        heatSupported = false;
+        coolSupported = true;
+      } else if (subfunctionHint === 'HEAT') {
+        heatSupported = true;
+        coolSupported = false;
+      } else {
+        heatSupported = modeHint !== 'COOL';
+        coolSupported = modeHint === 'COOL' || modeHint === 'HEAT_COOL';
+      }
+    } else if (functionId === SUPLA_FUNCTION.HVAC_DOMESTIC_HOT_WATER) {
+      heatSupported = true;
+      coolSupported = false;
+    } else {
+      heatSupported = true;
+      coolSupported = modeHint === 'COOL'
+        || modeHint === 'HEAT_COOL'
+        || subfunctionHint === 'COOL'
+        || subfunctionHint === 'HEAT_COOL';
+    }
+
+    if (modeHint === 'HEAT') {
+      heatSupported = true;
+    }
+    if (modeHint === 'COOL') {
+      coolSupported = true;
+    }
+    if (modeHint === 'HEAT_COOL' || subfunctionHint === 'HEAT_COOL') {
+      heatSupported = true;
+      coolSupported = true;
+    }
+
+    const allowed = [this.platform.Characteristic.TargetHeatingCoolingState.OFF];
+    if (heatSupported) {
+      allowed.push(this.platform.Characteristic.TargetHeatingCoolingState.HEAT);
+    }
+    if (coolSupported) {
+      allowed.push(this.platform.Characteristic.TargetHeatingCoolingState.COOL);
+    }
+    if (heatSupported && coolSupported) {
+      allowed.push(this.platform.Characteristic.TargetHeatingCoolingState.AUTO);
+    }
+
+    return Array.from(new Set(allowed));
+  }
+
+  private normalizeThermostatTargetMode(mode: number): number {
+    const allowed = this.readAllowedThermostatTargetModes();
+    if (allowed.includes(mode)) {
+      return mode;
+    }
+
+    if (allowed.includes(this.platform.Characteristic.TargetHeatingCoolingState.HEAT)) {
+      return this.platform.Characteristic.TargetHeatingCoolingState.HEAT;
+    }
+    if (allowed.includes(this.platform.Characteristic.TargetHeatingCoolingState.COOL)) {
+      return this.platform.Characteristic.TargetHeatingCoolingState.COOL;
+    }
+
+    return this.platform.Characteristic.TargetHeatingCoolingState.OFF;
+  }
+
+  private resolveThermostatTargetTemperature(targetMode: number, currentTemperature: number): number {
+    if (targetMode === this.platform.Characteristic.TargetHeatingCoolingState.COOL) {
+      return this.cachedThermostatCoolSetpoint;
+    }
+    if (targetMode === this.platform.Characteristic.TargetHeatingCoolingState.AUTO) {
+      return (this.cachedThermostatHeatSetpoint + this.cachedThermostatCoolSetpoint) / 2;
+    }
+    if (targetMode === this.platform.Characteristic.TargetHeatingCoolingState.HEAT) {
+      return this.cachedThermostatHeatSetpoint;
+    }
+
+    return currentTemperature;
+  }
+
+  private readAllowedHeaterCoolerTargetStates(): number[] {
+    const config = this.readConfigRecord();
+    const hvacConfig = this.readHvacConfigRecord(config);
+    const functionId = getChannelFunctionId(this.channel);
+    const modeHint = String(this.channel.state?.mode ?? '').toUpperCase();
+    const subfunctionHint = this.readNormalizedHvacSubfunction(config, hvacConfig);
+    const heatAvailable = this.readBooleanFromRecords(
+      [config, hvacConfig],
+      'heatingModeAvailable',
+      'heating_mode_available',
+    );
+    const coolAvailable = this.readBooleanFromRecords(
+      [config, hvacConfig],
+      'coolingModeAvailable',
+      'cooling_mode_available',
+    );
+
+    let heatSupported: boolean;
+    let coolSupported: boolean;
+    if (heatAvailable !== undefined || coolAvailable !== undefined) {
+      heatSupported = heatAvailable ?? false;
+      coolSupported = coolAvailable ?? false;
+    } else {
+      heatSupported = true;
+      coolSupported = functionId !== SUPLA_FUNCTION.HVAC_DOMESTIC_HOT_WATER
+        && (
+          modeHint === 'COOL'
+          || modeHint === 'HEAT_COOL'
+          || subfunctionHint === 'COOL'
+          || subfunctionHint === 'HEAT_COOL'
+        );
+    }
+
+    if (modeHint === 'HEAT') {
+      heatSupported = true;
+    }
+    if (modeHint === 'COOL') {
+      coolSupported = true;
+    }
+    if (modeHint === 'HEAT_COOL' || subfunctionHint === 'HEAT_COOL') {
+      heatSupported = true;
+      coolSupported = true;
+    }
+
+    const allowed: number[] = [];
+    if (heatSupported) {
+      allowed.push(this.platform.Characteristic.TargetHeaterCoolerState.HEAT);
+    }
+    if (coolSupported) {
+      allowed.push(this.platform.Characteristic.TargetHeaterCoolerState.COOL);
+    }
+    if (heatSupported && coolSupported) {
+      allowed.push(this.platform.Characteristic.TargetHeaterCoolerState.AUTO);
+    }
+
+    if (allowed.length === 0) {
+      allowed.push(this.platform.Characteristic.TargetHeaterCoolerState.HEAT);
+    }
+
+    return Array.from(new Set(allowed));
+  }
+
+  private normalizeHeaterCoolerTargetState(state: number): number {
+    const allowed = this.readAllowedHeaterCoolerTargetStates();
+    if (allowed.includes(state)) {
+      return state;
+    }
+
+    return allowed[0];
+  }
+
+  private readAutoOffsetRangeFromConfig(): { minGap: number; maxGap?: number } {
+    const config = this.readConfigRecord();
+    const hvacConfig = this.readHvacConfigRecord(config);
+    const constraints = this.asRecord(config.temperatureConstraints)
+      ?? this.asRecord(config.temperature_constraints)
+      ?? this.asRecord(hvacConfig?.temperatureConstraints)
+      ?? this.asRecord(hvacConfig?.temperature_constraints);
+    const minGapRaw = this.readNumberFromRecords([constraints], 'autoOffsetMin', 'auto_offset_min');
+    const maxGapRaw = this.readNumberFromRecords([constraints], 'autoOffsetMax', 'auto_offset_max');
+
+    const minGap = clampNumber(minGapRaw ?? 0.5, 0.1, 50);
+    const maxGap = maxGapRaw !== undefined
+      ? clampNumber(maxGapRaw, minGap, 100)
+      : undefined;
+
+    return { minGap, maxGap };
+  }
+
+  private normalizeHeatCoolSetpoints(
+    heat: number,
+    cool: number,
+    temperatureRange: { minValue: number; maxValue: number },
+    minGap: number,
+    maxGap: number | undefined,
+    preferredAnchor: 'heat' | 'cool' | 'center',
+  ): { heat: number; cool: number } {
+    const rangeSpan = temperatureRange.maxValue - temperatureRange.minValue;
+    const safeMinGap = clampNumber(minGap, 0.1, Math.max(rangeSpan, 0.1));
+    const safeMaxGap = maxGap !== undefined
+      ? clampNumber(maxGap, safeMinGap, Math.max(rangeSpan, safeMinGap))
+      : undefined;
+
+    let nextHeat = clampNumber(heat, temperatureRange.minValue, temperatureRange.maxValue);
+    let nextCool = clampNumber(cool, temperatureRange.minValue, temperatureRange.maxValue);
+
+    if (nextCool < nextHeat) {
+      if (preferredAnchor === 'cool') {
+        nextHeat = nextCool;
+      } else {
+        nextCool = nextHeat;
+      }
+    }
+
+    const applyGap = (gap: number): void => {
+      if (preferredAnchor === 'heat') {
+        nextCool = nextHeat + gap;
+      } else if (preferredAnchor === 'cool') {
+        nextHeat = nextCool - gap;
+      } else {
+        const center = (nextHeat + nextCool) / 2;
+        nextHeat = center - gap / 2;
+        nextCool = center + gap / 2;
+      }
+    };
+
+    let gap = nextCool - nextHeat;
+    if (safeMaxGap !== undefined && gap > safeMaxGap) {
+      applyGap(safeMaxGap);
+    }
+
+    gap = nextCool - nextHeat;
+    if (gap < safeMinGap) {
+      applyGap(safeMinGap);
+    }
+
+    nextHeat = clampNumber(nextHeat, temperatureRange.minValue, temperatureRange.maxValue);
+    nextCool = clampNumber(nextCool, temperatureRange.minValue, temperatureRange.maxValue);
+
+    gap = nextCool - nextHeat;
+    if (gap < safeMinGap) {
+      nextHeat = clampNumber(nextHeat, temperatureRange.minValue, temperatureRange.maxValue - safeMinGap);
+      nextCool = clampNumber(nextHeat + safeMinGap, temperatureRange.minValue, temperatureRange.maxValue);
+      if (nextCool - nextHeat < safeMinGap) {
+        nextCool = temperatureRange.maxValue;
+        nextHeat = clampNumber(nextCool - safeMinGap, temperatureRange.minValue, temperatureRange.maxValue);
+      }
+    }
+
+    if (safeMaxGap !== undefined && nextCool - nextHeat > safeMaxGap) {
+      nextCool = clampNumber(nextHeat + safeMaxGap, temperatureRange.minValue, temperatureRange.maxValue);
+    }
+
+    return {
+      heat: Number(nextHeat.toFixed(1)),
+      cool: Number(nextCool.toFixed(1)),
+    };
+  }
+
+  private readHvacConfigRecord(configRoot: Record<string, unknown>): Record<string, unknown> | undefined {
+    return this.asRecord(configRoot.hvacThermostat)
+      ?? this.asRecord(configRoot.hvac_thermostat)
+      ?? this.asRecord(configRoot.hvac);
+  }
+
+  private readNormalizedHvacSubfunction(
+    configRoot: Record<string, unknown>,
+    hvacConfig: Record<string, unknown> | undefined,
+  ): string {
+    const stateRecord = this.channel.state as Record<string, unknown> | undefined;
+    const rawSubfunction = stateRecord?.subfunction
+      ?? configRoot.subfunction
+      ?? configRoot.sub_function
+      ?? hvacConfig?.subfunction
+      ?? hvacConfig?.sub_function;
+    return String(rawSubfunction ?? '')
+      .trim()
+      .toUpperCase()
+      .replace(/[\s-]/g, '_');
+  }
+
+  private isAuxTemperatureControlType(rawControlType: unknown): boolean {
+    const normalized = String(rawControlType ?? '')
+      .trim()
+      .toUpperCase()
+      .replace(/[\s-]/g, '_');
+    return normalized === '2' || normalized === 'AUX_HEATER_COOLER_TEMPERATURE';
+  }
+
+  private readNumberFromRecords(
+    records: Array<Record<string, unknown> | undefined>,
+    ...keys: string[]
+  ): number | undefined {
+    for (const record of records) {
+      if (!record) {
+        continue;
+      }
+
+      for (const key of keys) {
+        const value = asNumber(record[key]);
+        if (value !== undefined) {
+          return value;
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  private readBooleanFromRecords(
+    records: Array<Record<string, unknown> | undefined>,
+    ...keys: string[]
+  ): boolean | undefined {
+    for (const record of records) {
+      if (!record) {
+        continue;
+      }
+
+      for (const key of keys) {
+        const value = asBoolean(record[key]);
+        if (value !== undefined) {
+          return value;
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  private asRecord(value: unknown): Record<string, unknown> | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return undefined;
+    }
+
+    return value as Record<string, unknown>;
   }
 
   private serializeForLog(payload: Record<string, unknown>): string {
