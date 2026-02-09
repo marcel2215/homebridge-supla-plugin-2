@@ -7,9 +7,13 @@ import type {
   PlatformConfig,
   Service,
 } from 'homebridge';
+import { randomBytes } from 'node:crypto';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 
 import { mapFunctionToServiceKind, SUPLA_FUNCTION } from './constants.js';
 import { SuplaApiClient, type SuplaApiClientOptions } from './suplaApiClient.js';
+import { SuplaNativeClient, type SuplaNativeClientStatus } from './suplaNativeClient.js';
 import { SuplaChannelAccessory } from './platformAccessory.js';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js';
 import {
@@ -25,10 +29,22 @@ interface SuplaPlatformConfig extends PlatformConfig {
   email?: string;
   password?: string;
   server?: string;
+  transport?: 'native' | 'rest';
   apiPrefix?: string;
   pollIntervalSeconds?: number;
   requestTimeoutMs?: number;
   includeHidden?: boolean;
+  nativeHelperPath?: string;
+  nativeSsl?: boolean;
+  nativePort?: number;
+  nativeProtocolVersion?: number;
+  nativeConnectTimeoutMs?: number;
+  nativeReconnectDelayMs?: number;
+  nativeActionTimeoutMs?: number;
+  nativeClientName?: string;
+  nativeClientSoftVersion?: string;
+  nativeGuid?: string;
+  nativeAuthKey?: string;
 }
 
 interface SyncSummary {
@@ -44,8 +60,13 @@ interface SyncSummary {
 
 const DEFAULT_POLL_INTERVAL_SECONDS = 10;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_NATIVE_CONNECT_TIMEOUT_MS = 5_000;
+const DEFAULT_NATIVE_RECONNECT_DELAY_MS = 2_000;
+const DEFAULT_NATIVE_ACTION_TIMEOUT_MS = 12_000;
 const INITIALIZATION_RETRY_DELAYS_SECONDS = [5, 10, 20, 40, 60, 120];
 const REFRESH_FAILURES_BEFORE_RECOVERY = 3;
+const CHANNEL_SYNC_DEBOUNCE_MS = 80;
+const NATIVE_IDENTITY_DIRECTORY = 'homebridge-supla-plugin-2';
 
 export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
@@ -62,6 +83,7 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
   private pollTimer: NodeJS.Timeout | undefined;
   private startupRetryTimer: NodeJS.Timeout | undefined;
   private immediateRefreshTimer: NodeJS.Timeout | undefined;
+  private realtimeSyncTimer: NodeJS.Timeout | undefined;
   private pollInFlight = false;
   private queuedRefreshAfterCurrent = false;
   private shuttingDown = false;
@@ -69,8 +91,11 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
   private startupRetryAttempt = 0;
   private refreshFailureStreak = 0;
   private supportsChannelStatesEndpoint: boolean | undefined;
+  private transportMode: 'native' | 'rest' = 'native';
+  private latestRealtimeSnapshot: SuplaChannel[] | undefined;
 
-  private client: SuplaApiClient | undefined;
+  private apiClient: SuplaApiClient | undefined;
+  private nativeClient: SuplaNativeClient | undefined;
 
   constructor(
     public readonly log: Logging,
@@ -94,12 +119,21 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
   }
 
   async executeChannelAction(channelId: number, payload: Record<string, unknown>): Promise<void> {
-    if (!this.client) {
-      throw new Error('SUPLA client is not initialized.');
+    if (this.transportMode === 'native') {
+      if (!this.nativeClient) {
+        throw new Error('SUPLA native client is not initialized.');
+      }
+
+      await this.nativeClient.executeChannelAction(channelId, payload);
+      return;
+    }
+
+    if (!this.apiClient) {
+      throw new Error('SUPLA API client is not initialized.');
     }
 
     try {
-      await this.client.executeChannelAction(channelId, payload);
+      await this.apiClient.executeChannelAction(channelId, payload);
       this.schedulePostActionRefresh(channelId);
     } catch (error) {
       this.log.warn(
@@ -119,13 +153,25 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
       return;
     }
 
+    this.transportMode = this.getTransportMode(pluginConfig);
+
     const pollIntervalSeconds = this.getPollIntervalSeconds(pluginConfig);
     const requestTimeoutMs = this.getRequestTimeoutMs(pluginConfig);
     this.log.info(
-      `Starting SUPLA platform for ${this.maskEmail(pluginConfig.email)} (poll=${pollIntervalSeconds}s, timeout=${requestTimeoutMs}ms).`,
+      `Starting SUPLA platform for ${this.maskEmail(pluginConfig.email)} `
+      + `(transport=${this.transportMode}, poll=${pollIntervalSeconds}s, timeout=${requestTimeoutMs}ms).`,
     );
 
-    const initialized = await this.initializeClient(pluginConfig);
+    if (this.transportMode === 'native') {
+      const initialized = await this.initializeNativeClient(pluginConfig);
+      if (!initialized) {
+        return;
+      }
+
+      return;
+    }
+
+    const initialized = await this.initializeRestClient(pluginConfig);
     if (!initialized) {
       return;
     }
@@ -152,10 +198,23 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
       this.immediateRefreshTimer = undefined;
     }
 
+    if (this.realtimeSyncTimer) {
+      clearTimeout(this.realtimeSyncTimer);
+      this.realtimeSyncTimer = undefined;
+    }
+
     for (const timer of this.postActionRefreshTimers) {
       clearTimeout(timer);
     }
     this.postActionRefreshTimers.clear();
+
+    const nativeClientToStop = this.nativeClient;
+    this.nativeClient = undefined;
+    if (nativeClientToStop) {
+      void nativeClientToStop.stop().catch((error) => {
+        this.log.warn(`SUPLA native helper stop failed: ${this.errorMessage(error)}`);
+      });
+    }
 
     for (const handler of this.channelHandlers.values()) {
       handler.dispose();
@@ -164,6 +223,8 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
     this.channelHandlers.clear();
     this.cachedChannelsById.clear();
     this.supportsChannelStatesEndpoint = undefined;
+    this.latestRealtimeSnapshot = undefined;
+    this.apiClient = undefined;
     this.log.info('SUPLA platform stopped.');
   }
 
@@ -180,17 +241,18 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
     this.log.info(`SUPLA polling started (every ${intervalSeconds}s).`);
   }
 
-  private async initializeClient(config: SuplaPlatformConfig): Promise<boolean> {
-    this.client = new SuplaApiClient(this.buildClientOptions(config), {
+  private async initializeRestClient(config: SuplaPlatformConfig): Promise<boolean> {
+    this.apiClient = new SuplaApiClient(this.buildClientOptions(config), {
       debug: (message: string) => this.log.debug(message),
       warn: (message: string) => this.log.warn(message),
       error: (message: string) => this.log.error(message),
     });
+    this.nativeClient = undefined;
     this.supportsChannelStatesEndpoint = undefined;
     this.cachedChannelsById.clear();
 
     try {
-      await this.client.initialize();
+      await this.apiClient.initialize();
       this.startupRetryAttempt = 0;
       this.clearStartupRetryTimer();
       this.log.info('SUPLA cloud connection established.');
@@ -198,6 +260,99 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
     } catch (error) {
       this.log.error(`SUPLA initialization failed: ${this.errorMessage(error)}`);
       this.markAllAccessoriesReachability(false);
+      this.scheduleStartupRetry();
+      return false;
+    }
+  }
+
+  private async initializeNativeClient(config: SuplaPlatformConfig): Promise<boolean> {
+    let identity: { guidHex: string; authKeyHex: string } | undefined;
+    try {
+      identity = await this.resolveNativeIdentity(config);
+    } catch (error) {
+      this.log.error(`SUPLA native identity initialization failed: ${this.errorMessage(error)}`);
+      this.markAllAccessoriesReachability(false);
+      this.scheduleStartupRetry();
+      return false;
+    }
+
+    if (!identity) {
+      this.markAllAccessoriesReachability(false);
+      this.scheduleStartupRetry();
+      return false;
+    }
+
+    if (this.nativeClient) {
+      try {
+        await this.nativeClient.stop();
+      } catch (error) {
+        this.log.warn(`Failed to stop previous SUPLA native client: ${this.errorMessage(error)}`);
+      }
+    }
+
+    this.nativeClient = new SuplaNativeClient(
+      {
+        email: config.email!,
+        password: config.password!,
+        server: config.server,
+        helperPath: config.nativeHelperPath,
+        ssl: typeof config.nativeSsl === 'boolean' ? config.nativeSsl : undefined,
+        port: asNumber(config.nativePort),
+        protocolVersion: asNumber(config.nativeProtocolVersion),
+        connectTimeoutMs: this.getNativeConnectTimeoutMs(config),
+        reconnectDelayMs: this.getNativeReconnectDelayMs(config),
+        actionTimeoutMs: this.getNativeActionTimeoutMs(config),
+        requestTimeoutMs: this.getRequestTimeoutMs(config),
+        guidHex: identity.guidHex,
+        authKeyHex: identity.authKeyHex,
+        clientName: config.nativeClientName ?? 'Homebridge SUPLA',
+        clientSoftVersion: config.nativeClientSoftVersion ?? `${PLUGIN_NAME}/${this.safePluginVersion()}`,
+      },
+      {
+        info: (message: string) => this.log.info(message),
+        debug: (message: string) => this.log.debug(message),
+        warn: (message: string) => this.log.warn(message),
+        error: (message: string) => this.log.error(message),
+      },
+      {
+        onChannelsChanged: (channels: SuplaChannel[]) => {
+          this.onRealtimeChannelsChanged(channels);
+        },
+        onStatusChange: (status: SuplaNativeClientStatus, detail?: string) => {
+          this.onNativeStatus(status, detail);
+        },
+        onTerminated: (unexpected: boolean) => {
+          this.onNativeTerminated(unexpected);
+        },
+      },
+    );
+
+    this.apiClient = undefined;
+    this.supportsChannelStatesEndpoint = undefined;
+    this.cachedChannelsById.clear();
+
+    try {
+      await this.nativeClient.start();
+      this.startupRetryAttempt = 0;
+      this.clearStartupRetryTimer();
+      this.log.info('SUPLA native protocol connection established.');
+      return true;
+    } catch (error) {
+      const failedClient = this.nativeClient;
+      this.nativeClient = undefined;
+      if (failedClient) {
+        try {
+          await failedClient.stop();
+        } catch (stopError) {
+          this.log.warn(
+            `SUPLA native cleanup after failed start did not complete cleanly: ${this.errorMessage(stopError)}`,
+          );
+        }
+      }
+
+      this.log.error(`SUPLA native initialization failed: ${this.errorMessage(error)}`);
+      this.markAllAccessoriesReachability(false);
+      this.latestRealtimeSnapshot = undefined;
       this.scheduleStartupRetry();
       return false;
     }
@@ -248,7 +403,12 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
     }
 
     const config = this.getTypedConfig();
-    const initialized = await this.initializeClient(config);
+    if (this.transportMode === 'native') {
+      await this.initializeNativeClient(config);
+      return;
+    }
+
+    const initialized = await this.initializeRestClient(config);
     if (!initialized) {
       return;
     }
@@ -258,7 +418,11 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
   }
 
   private async refreshChannels(preferStateRefresh = false): Promise<void> {
-    if (this.pollInFlight || !this.client || this.shuttingDown) {
+    if (this.transportMode !== 'rest') {
+      return;
+    }
+
+    if (this.pollInFlight || !this.apiClient || this.shuttingDown) {
       if (this.pollInFlight && !this.shuttingDown) {
         this.queuedRefreshAfterCurrent = true;
       }
@@ -282,7 +446,7 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
       }
 
       if (refreshType === 'full') {
-        const channels = await this.client.listChannels();
+        const channels = await this.apiClient.listChannels();
         refreshedChannelsCount = channels.length;
         this.replaceCachedChannels(channels);
         this.syncAccessories(channels);
@@ -360,7 +524,7 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
   }
 
   private async tryRefreshChannelsFromStates(): Promise<boolean> {
-    if (!this.client) {
+    if (!this.apiClient) {
       return false;
     }
 
@@ -373,7 +537,7 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
     }
 
     try {
-      const snapshots = await this.client.listChannelStates();
+      const snapshots = await this.apiClient.listChannelStates();
       let mergedCount = 0;
 
       for (const snapshot of snapshots) {
@@ -439,6 +603,10 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
   }
 
   private async recoverClient(): Promise<void> {
+    if (this.transportMode !== 'rest') {
+      return;
+    }
+
     if (this.recoveryInFlight || this.shuttingDown) {
       return;
     }
@@ -455,7 +623,7 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
 
     try {
       const config = this.getTypedConfig();
-      const initialized = await this.initializeClient(config);
+      const initialized = await this.initializeRestClient(config);
       if (!initialized) {
         return;
       }
@@ -619,6 +787,130 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
     }
 
     this.log.debug(text);
+  }
+
+  private onRealtimeChannelsChanged(channels: SuplaChannel[]): void {
+    if (this.shuttingDown || this.transportMode !== 'native') {
+      return;
+    }
+
+    this.latestRealtimeSnapshot = channels;
+
+    if (this.realtimeSyncTimer) {
+      return;
+    }
+
+    this.realtimeSyncTimer = setTimeout(() => {
+      this.realtimeSyncTimer = undefined;
+      void this.syncRealtimeSnapshot();
+    }, CHANNEL_SYNC_DEBOUNCE_MS);
+    this.realtimeSyncTimer.unref();
+  }
+
+  private async syncRealtimeSnapshot(): Promise<void> {
+    if (this.shuttingDown || this.transportMode !== 'native') {
+      return;
+    }
+
+    const snapshot = this.latestRealtimeSnapshot;
+    if (!snapshot) {
+      return;
+    }
+
+    try {
+      this.replaceCachedChannels(snapshot);
+      this.syncAccessories(snapshot);
+      this.refreshFailureStreak = 0;
+    } catch (error) {
+      this.log.error(`SUPLA realtime sync failed: ${this.errorMessage(error)}`);
+    }
+  }
+
+  private onNativeStatus(status: SuplaNativeClientStatus, detail?: string): void {
+    if (this.transportMode !== 'native') {
+      return;
+    }
+
+    const detailSuffix = detail ? ` detail=${detail}` : '';
+    this.log.debug(`SUPLA native status=${status}${detailSuffix}`);
+
+    if (status === 'registered') {
+      this.markAllAccessoriesReachability(true);
+      return;
+    }
+
+    if (
+      status === 'disconnected'
+      || status === 'connecting'
+      || status === 'registering'
+      || status === 'initialized'
+      || status === 'stopping'
+      || status === 'stopped'
+    ) {
+      this.markAllAccessoriesReachability(false);
+      return;
+    }
+  }
+
+  private onNativeTerminated(unexpected: boolean): void {
+    if (this.shuttingDown || this.transportMode !== 'native') {
+      return;
+    }
+
+    this.markAllAccessoriesReachability(false);
+    this.latestRealtimeSnapshot = undefined;
+    this.nativeClient = undefined;
+
+    if (!unexpected) {
+      return;
+    }
+
+    this.log.warn('SUPLA native helper terminated unexpectedly; scheduling restart.');
+    this.scheduleStartupRetry();
+  }
+
+  private async resolveNativeIdentity(
+    config: SuplaPlatformConfig,
+  ): Promise<{ guidHex: string; authKeyHex: string } | undefined> {
+    const configuredGuid = this.validateFixedHex(config.nativeGuid, 16);
+    const configuredAuthKey = this.validateFixedHex(config.nativeAuthKey, 16);
+    if (configuredGuid && configuredAuthKey) {
+      return { guidHex: configuredGuid, authKeyHex: configuredAuthKey };
+    }
+
+    const storagePath = this.api.user.storagePath();
+    const email = (config.email ?? '').trim().toLowerCase();
+    if (!storagePath || !email) {
+      this.log.error('SUPLA native identity setup failed: missing Homebridge storage path or email.');
+      return undefined;
+    }
+
+    const safeEmail = email.replace(/[^a-z0-9]+/gi, '_');
+    const identityDir = path.join(storagePath, NATIVE_IDENTITY_DIRECTORY);
+    const identityPath = path.join(identityDir, `${safeEmail}.json`);
+
+    await mkdir(identityDir, { recursive: true });
+
+    try {
+      const raw = await readFile(identityPath, 'utf8');
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const guidHex = this.validateFixedHex(parsed.guidHex, 16);
+      const authKeyHex = this.validateFixedHex(parsed.authKeyHex, 16);
+      if (guidHex && authKeyHex) {
+        return { guidHex, authKeyHex };
+      }
+    } catch {
+      // Ignore read/parse errors and create a new identity below.
+    }
+
+    const nextIdentity = {
+      guidHex: configuredGuid ?? randomBytes(16).toString('hex'),
+      authKeyHex: configuredAuthKey ?? randomBytes(16).toString('hex'),
+    };
+
+    await writeFile(identityPath, `${JSON.stringify(nextIdentity, null, 2)}\n`, 'utf8');
+    this.log.info(`SUPLA native identity initialized at ${identityPath}.`);
+    return nextIdentity;
   }
 
   private enrichChannelWithLinkedSensors(
@@ -868,6 +1160,11 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
     return this.config as SuplaPlatformConfig;
   }
 
+  private getTransportMode(config: SuplaPlatformConfig): 'native' | 'rest' {
+    const normalized = String(config.transport ?? 'native').trim().toLowerCase();
+    return normalized === 'rest' ? 'rest' : 'native';
+  }
+
   private getPollIntervalSeconds(config: SuplaPlatformConfig): number {
     const configured = config.pollIntervalSeconds ?? DEFAULT_POLL_INTERVAL_SECONDS;
     if (!Number.isFinite(configured)) {
@@ -884,6 +1181,43 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
     }
 
     return Math.max(2_000, Math.min(60_000, Math.round(configured)));
+  }
+
+  private getNativeConnectTimeoutMs(config: SuplaPlatformConfig): number {
+    const configured = asNumber(config.nativeConnectTimeoutMs) ?? DEFAULT_NATIVE_CONNECT_TIMEOUT_MS;
+    return Math.max(1_000, Math.min(60_000, Math.round(configured)));
+  }
+
+  private getNativeReconnectDelayMs(config: SuplaPlatformConfig): number {
+    const configured = asNumber(config.nativeReconnectDelayMs) ?? DEFAULT_NATIVE_RECONNECT_DELAY_MS;
+    return Math.max(500, Math.min(60_000, Math.round(configured)));
+  }
+
+  private getNativeActionTimeoutMs(config: SuplaPlatformConfig): number {
+    const configured = asNumber(config.nativeActionTimeoutMs) ?? DEFAULT_NATIVE_ACTION_TIMEOUT_MS;
+    return Math.max(2_000, Math.min(60_000, Math.round(configured)));
+  }
+
+  private validateFixedHex(value: unknown, byteLength: number): string | undefined {
+    if (typeof value !== 'string') {
+      return undefined;
+    }
+
+    const normalized = value.trim().toLowerCase();
+    if (!new RegExp(`^[a-f0-9]{${byteLength * 2}}$`).test(normalized)) {
+      return undefined;
+    }
+
+    return normalized;
+  }
+
+  private safePluginVersion(): string {
+    const fromEnv = process.env.npm_package_version;
+    if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) {
+      return fromEnv.trim();
+    }
+
+    return 'dev';
   }
 
   private errorMessage(error: unknown): string {

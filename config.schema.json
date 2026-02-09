@@ -34,10 +34,90 @@
         "type": "string",
         "description": "Optional SUPLA cloud server hostname or URL. If omitted, autodiscover is used."
       },
+      "transport": {
+        "title": "Transport",
+        "type": "string",
+        "default": "native",
+        "enum": [
+          "native",
+          "rest"
+        ],
+        "description": "Select SUPLA native realtime protocol (recommended) or REST fallback."
+      },
+      "nativeHelperPath": {
+        "title": "Native Helper Path",
+        "type": "string",
+        "description": "Optional absolute path to supla-native-bridge helper binary."
+      },
+      "nativeSsl": {
+        "title": "Native SSL",
+        "type": "boolean",
+        "description": "Override native protocol SSL setting. If omitted, derived from server URL."
+      },
+      "nativePort": {
+        "title": "Native Port",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 65535,
+        "description": "Override SUPLA native protocol port (default 2016 SSL / 2015 TCP)."
+      },
+      "nativeProtocolVersion": {
+        "title": "Native Protocol Version",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 255,
+        "description": "Optional SUPLA protocol version override."
+      },
+      "nativeConnectTimeoutMs": {
+        "title": "Native Connect Timeout (ms)",
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 60000,
+        "default": 5000,
+        "description": "Connection timeout for native SUPLA protocol."
+      },
+      "nativeReconnectDelayMs": {
+        "title": "Native Reconnect Delay (ms)",
+        "type": "integer",
+        "minimum": 500,
+        "maximum": 60000,
+        "default": 2000,
+        "description": "Reconnect delay used by native SUPLA helper."
+      },
+      "nativeActionTimeoutMs": {
+        "title": "Native Action Timeout (ms)",
+        "type": "integer",
+        "minimum": 2000,
+        "maximum": 60000,
+        "default": 12000,
+        "description": "Timeout waiting for action acknowledgement from native SUPLA helper."
+      },
+      "nativeClientName": {
+        "title": "Native Client Name",
+        "type": "string",
+        "description": "Optional SUPLA client name override sent during native registration."
+      },
+      "nativeClientSoftVersion": {
+        "title": "Native Client Version",
+        "type": "string",
+        "description": "Optional SUPLA client software version override sent during native registration."
+      },
+      "nativeGuid": {
+        "title": "Native GUID (hex)",
+        "type": "string",
+        "pattern": "^[A-Fa-f0-9]{32}$",
+        "description": "Optional fixed SUPLA client GUID in hex. If omitted, plugin stores a persistent generated GUID."
+      },
+      "nativeAuthKey": {
+        "title": "Native Auth Key (hex)",
+        "type": "string",
+        "pattern": "^[A-Fa-f0-9]{32}$",
+        "description": "Optional fixed SUPLA client AuthKey in hex. If omitted, plugin stores a persistent generated key."
+      },
       "apiPrefix": {
         "title": "API Prefix Override",
         "type": "string",
-        "description": "Optional API prefix override (for example /api/3)."
+        "description": "REST transport only: optional API prefix override (for example /api/3)."
       },
       "pollIntervalSeconds": {
         "title": "Polling Interval (s)",
@@ -45,7 +125,7 @@
         "minimum": 2,
         "maximum": 120,
         "default": 10,
-        "description": "How often channel states are refreshed from SUPLA cloud."
+        "description": "REST transport only: how often channel states are refreshed from SUPLA cloud."
       },
       "requestTimeoutMs": {
         "title": "Request Timeout (ms)",
@@ -53,7 +133,7 @@
         "minimum": 2000,
         "maximum": 60000,
         "default": 10000,
-        "description": "Timeout for SUPLA cloud HTTP requests."
+        "description": "REST transport: HTTP timeout. Native transport: fallback timeout for helper operations."
       },
       "includeHidden": {
         "title": "Include Hidden Channels",

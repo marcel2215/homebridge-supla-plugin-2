@@ -491,7 +491,16 @@ export class SuplaChannelAccessory {
     const connectedCode = String(state.connectedCode ?? '').trim();
     if (connectedCode.length > 0 && connectedCode !== '0') {
       const normalizedCode = connectedCode.toUpperCase();
-      if (normalizedCode !== 'CONNECTED' && normalizedCode !== 'OK') {
+      const normalConnectedCodes = new Set([
+        'CONNECTED',
+        'OK',
+        'ONLINE',
+        'ONLINE_BUT_NOT_AVAILABLE',
+        'OFFLINE',
+        'OFFLINE_REMOTE_WAKEUP_NOT_SUPPORTED',
+        'FIRMWARE_UPDATE_ONGOING',
+      ]);
+      if (!normalConnectedCodes.has(normalizedCode)) {
         all.push(`connectedCode=${connectedCode}`);
       }
     }
@@ -1221,11 +1230,14 @@ export class SuplaChannelAccessory {
       }
 
       const directAction = openRequested ? SUPLA_ACTION.OPEN : SUPLA_ACTION.CLOSE;
-      const canUseDirectAction = this.isActionAdvertised(directAction);
-      const canUseToggleAction = this.isActionAdvertised(SUPLA_ACTION.OPEN_CLOSE);
-      const action = canUseDirectAction
-        ? directAction
-        : (canUseToggleAction ? SUPLA_ACTION.OPEN_CLOSE : directAction);
+      const hasAdvertisedActions = this.hasAdvertisedActions();
+      const canUseDirectAction = hasAdvertisedActions && this.isActionAdvertised(directAction);
+      const canUseToggleAction = hasAdvertisedActions
+        ? this.isActionAdvertised(SUPLA_ACTION.OPEN_CLOSE)
+        : true;
+      const action = canUseToggleAction
+        ? SUPLA_ACTION.OPEN_CLOSE
+        : directAction;
       const reversingInProgress = action === SUPLA_ACTION.OPEN_CLOSE
         && (
           (currentDoorState === this.platform.Characteristic.CurrentDoorState.OPENING && !openRequested)
@@ -1235,16 +1247,26 @@ export class SuplaChannelAccessory {
       this.platform.log.debug(
         `SUPLA channel ${this.channel.id}: gate action strategy requested=${openRequested ? 'OPEN' : 'CLOSE'}, `
         + `selected=${action}, directAdvertised=${canUseDirectAction}, toggleAdvertised=${canUseToggleAction}, `
-        + `hasSensors=${hasSensors}, reversingInProgress=${reversingInProgress}.`,
+        + `hasAdvertisedActions=${hasAdvertisedActions}, hasSensors=${hasSensors}, `
+        + `reversingInProgress=${reversingInProgress}.`,
       );
       await this.performDoorMovement(openRequested, state, async () => {
-        if (reversingInProgress) {
-          this.platform.log.debug(
-            `SUPLA channel ${this.channel.id}: reversing gate movement via OPEN_CLOSE double pulse.`,
-          );
-          await this.executeAction({ action: SUPLA_ACTION.OPEN_CLOSE });
-          await this.delay(GATE_REVERSE_TOGGLE_DELAY_MS);
+        if (action === SUPLA_ACTION.OPEN_CLOSE) {
+          try {
+            await this.executeGateToggle(reversingInProgress);
+          } catch (error) {
+            if (!canUseDirectAction || reversingInProgress) {
+              throw error;
+            }
+
+            this.platform.log.warn(
+              `SUPLA channel ${this.channel.id}: OPEN_CLOSE strategy failed, retrying with direct action ${directAction}.`,
+            );
+            await this.executeAction({ action: directAction });
+          }
+          return;
         }
+
         await this.executeAction({ action });
       });
       return;
@@ -1595,6 +1617,14 @@ export class SuplaChannelAccessory {
     return possibleActions.includes(actionName.toUpperCase());
   }
 
+  private hasAdvertisedActions(): boolean {
+    return (this.channel.possibleActions ?? [])
+      .some((action) => {
+        const name = String(action.name ?? action.caption ?? '').trim();
+        return name.length > 0;
+      });
+  }
+
   private readOnState(state: SuplaChannelState): boolean {
     const explicit = asBoolean(state.on);
     if (explicit !== undefined) {
@@ -1761,7 +1791,7 @@ export class SuplaChannelAccessory {
       return undefined;
     }
 
-    return Math.max(...allSections) + 1;
+    return Math.max(1, Math.max(...allSections));
   }
 
   private readDigiglassTransparentSections(state: SuplaChannelState): number[] {
@@ -1771,7 +1801,7 @@ export class SuplaChannelAccessory {
 
     return state.transparent
       .map((value) => asNumber(value))
-      .filter((value): value is number => value !== undefined && value >= 0)
+      .filter((value): value is number => value !== undefined && value > 0)
       .map((value) => Math.floor(value));
   }
 
@@ -1782,7 +1812,7 @@ export class SuplaChannelAccessory {
 
     return state.opaque
       .map((value) => asNumber(value))
-      .filter((value): value is number => value !== undefined && value >= 0)
+      .filter((value): value is number => value !== undefined && value > 0)
       .map((value) => Math.floor(value));
   }
 
@@ -2402,6 +2432,18 @@ export class SuplaChannelAccessory {
       `SUPLA channel ${this.channel.id}: clearing pending door movement (${reason}).`,
     );
     this.pendingDoorMovement = undefined;
+  }
+
+  private async executeGateToggle(reversingInProgress: boolean): Promise<void> {
+    if (reversingInProgress) {
+      this.platform.log.debug(
+        `SUPLA channel ${this.channel.id}: reversing gate movement via OPEN_CLOSE double pulse.`,
+      );
+      await this.executeAction({ action: SUPLA_ACTION.OPEN_CLOSE });
+      await this.delay(GATE_REVERSE_TOGGLE_DELAY_MS);
+    }
+
+    await this.executeAction({ action: SUPLA_ACTION.OPEN_CLOSE });
   }
 
   private readTemperatureRangeFromConfig(defaultMin: number, defaultMax: number): { minValue: number; maxValue: number } {

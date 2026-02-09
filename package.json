@@ -27,8 +27,10 @@
     "homebridge": "^1.8.0 || ^2.0.0-beta.0"
   },
   "scripts": {
-    "build": "rimraf ./dist && tsc",
+    "build": "rimraf ./dist && tsc && npm run build:native",
+    "build:native": "node scripts/build-native-helper.mjs --optional",
     "lint": "eslint . --max-warnings=0",
+    "postinstall": "npm run build:native",
     "prepublishOnly": "npm run lint && npm run build",
     "watch": "npm run build && npm link && nodemon"
   },

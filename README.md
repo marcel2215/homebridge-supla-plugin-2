@@ -2,16 +2,17 @@
 
 Homebridge dynamic platform plugin for SUPLA cloud.
 
-This plugin authenticates with SUPLA using the same email/password account credentials used in the mobile app, autodiscovers the target cloud server, reads channels/states from SUPLA Cloud API, and executes channel actions through the cloud action endpoint.
+This plugin authenticates with SUPLA using the same email/password account credentials used in the iOS app.  
+By default it uses native SUPLA client protocol (same protocol family as the mobile app), receives realtime events from SUPLA cloud, and executes actions through the native protocol helper.
 
 ## Features
 
-- Email/password authentication (`/api/webapp-tokens`) with retry and refresh fallback.
-- SUPLA autodiscovery (`https://autodiscover.supla.org/users/{email}`).
-- Cloud API path fallback (`/api/3`, `/api/v3`, `/api`).
+- Native SUPLA protocol transport (`SuplaClient` C library helper) with event-driven updates (no polling in native mode).
+- Email/password authentication with SUPLA autodiscovery (`https://autodiscover.supla.org/users/{email}`).
+- Persistent native GUID/AuthKey identity per account (stored in Homebridge storage path).
 - Dynamic accessory discovery and cache reconciliation.
-- Action execution via `PATCH /channels/{id}`.
-- Robust polling/retry behavior and offline state propagation.
+- Robust reconnect/retry behavior and offline state propagation.
+- Optional REST fallback transport for environments where native helper is unavailable.
 
 ## Supported HomeKit mappings
 
@@ -44,8 +45,9 @@ Add this platform section to Homebridge:
       "name": "SUPLA",
       "email": "user@example.com",
       "password": "your-password",
-      "pollIntervalSeconds": 10,
-      "requestTimeoutMs": 10000,
+      "transport": "native",
+      "nativeConnectTimeoutMs": 5000,
+      "nativeReconnectDelayMs": 2000,
       "includeHidden": false
     }
   ]
@@ -55,7 +57,11 @@ Add this platform section to Homebridge:
 Optional fields:
 
 - `server`: force a specific SUPLA cloud host/URL (skip autodiscover).
-- `apiPrefix`: force API prefix (for example `/api/3`).
+- `nativeHelperPath`: absolute path to `supla-native-bridge`.
+- `nativePort`, `nativeSsl`, `nativeProtocolVersion`: native transport overrides.
+- `nativeGuid`, `nativeAuthKey`: fixed hex credentials (32 hex chars each). If omitted, plugin persists generated values automatically.
+- `transport: "rest"`: use REST fallback transport.
+- `apiPrefix`, `pollIntervalSeconds`: REST-only options.
 
 ## Development
 
@@ -63,4 +69,11 @@ Optional fields:
 npm install
 npm run lint
 npm run build
+```
+
+Native helper binary is built automatically on `postinstall` (best-effort/optional).  
+To rebuild manually:
+
+```bash
+npm run build:native
 ```
