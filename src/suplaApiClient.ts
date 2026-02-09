@@ -192,11 +192,17 @@ export class SuplaApiClient {
   }
 
   private normalizeApiPrefix(prefix: string): string {
-    if (!prefix.startsWith('/')) {
-      return `/${prefix}`;
+    const trimmed = prefix.trim();
+    if (!trimmed) {
+      return '/api/3';
     }
 
-    return prefix;
+    const withLeadingSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+    if (withLeadingSlash.length > 1 && withLeadingSlash.endsWith('/')) {
+      return withLeadingSlash.slice(0, -1);
+    }
+
+    return withLeadingSlash;
   }
 
   private async resolveBaseUrl(): Promise<string> {

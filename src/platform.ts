@@ -98,8 +98,16 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
       throw new Error('SUPLA client is not initialized.');
     }
 
-    await this.client.executeChannelAction(channelId, payload);
-    this.schedulePostActionRefresh(channelId);
+    try {
+      await this.client.executeChannelAction(channelId, payload);
+      this.schedulePostActionRefresh(channelId);
+    } catch (error) {
+      this.log.warn(
+        `SUPLA action failed on channel ${channelId}; scheduling immediate state refresh: ${this.errorMessage(error)}`,
+      );
+      this.requestImmediateRefresh(`failed action on channel ${channelId}`, 0);
+      throw error;
+    }
   }
 
   private async start(): Promise<void> {
@@ -766,12 +774,43 @@ export class SuplaHomebridgePlatform implements DynamicPlatformPlugin {
       return undefined;
     }
 
-    const closed = asBoolean(sensorState.closed);
+    const closed = this.readBinaryBoolean(sensorState.closed);
     if (closed !== undefined) {
       return closed;
     }
 
-    return asBoolean(sensorState.hi);
+    return this.readBinaryBoolean(sensorState.hi);
+  }
+
+  private readBinaryBoolean(value: unknown): boolean | undefined {
+    if (typeof value === 'boolean') {
+      return value;
+    }
+
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === 'true' || normalized === '1') {
+        return true;
+      }
+      if (normalized === 'false' || normalized === '0') {
+        return false;
+      }
+      return undefined;
+    }
+
+    const numeric = asNumber(value);
+    if (numeric === undefined) {
+      return undefined;
+    }
+
+    if (numeric === 1) {
+      return true;
+    }
+    if (numeric === 0) {
+      return false;
+    }
+
+    return undefined;
   }
 
   private logMissingLinkedSensor(parentId: number, sensorId: number, role: 'opening' | 'partial'): void {

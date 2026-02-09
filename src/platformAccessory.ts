@@ -40,6 +40,7 @@ const DEFAULT_COLOR_TEMPERATURE_MIREDS = 300;
 const MIN_HOMEKIT_COLOR_TEMPERATURE_MIREDS = 140;
 const MAX_HOMEKIT_COLOR_TEMPERATURE_MIREDS = 500;
 const GATE_MOVEMENT_TIMEOUT_MS = 45_000;
+const GATE_REVERSE_TOGGLE_DELAY_MS = 350;
 
 interface PendingDoorMovement {
   expectedOpen: boolean;
@@ -76,6 +77,9 @@ export class SuplaChannelAccessory {
   private cachedThermostatCoolSetpoint = 24;
   private lastConnectionState: boolean | undefined;
   private pendingDoorMovement: PendingDoorMovement | undefined;
+  private lastGaragePhysicalState: 'open' | 'closed' | 'partial' | 'unknown' | undefined;
+  private hasDeviceFault = false;
+  private lastIssueSignature = '';
   private toggleWithoutSensorsWarningLogged = false;
 
   constructor(
@@ -109,6 +113,7 @@ export class SuplaChannelAccessory {
       ?? asBoolean(channel.connected)
       ?? true;
     this.applyConnectionState(connected);
+    this.updateFaultDiagnostics(connected, state);
     this.platform.log.debug(
       `SUPLA channel ${channel.id} state update: service=${this.serviceKind}, connected=${connected}, `
       + `on=${String(state.on)}, hi=${String(state.hi)}, shut=${String(state.shut)}`,
@@ -402,6 +407,16 @@ export class SuplaChannelAccessory {
       const service = this.accessory.addService(this.platform.Service.Valve, displayName);
       service.getCharacteristic(this.platform.Characteristic.Active)
         .onSet(this.handleValveActiveSet.bind(this));
+      this.updateIfPresent(
+        service,
+        this.platform.Characteristic.ValveType,
+        this.platform.Characteristic.ValveType.GENERIC_VALVE,
+      );
+      this.updateIfPresent(
+        service,
+        this.platform.Characteristic.IsConfigured,
+        this.platform.Characteristic.IsConfigured.CONFIGURED,
+      );
       return { main: service };
     }
     default: {
@@ -434,13 +449,79 @@ export class SuplaChannelAccessory {
 
     for (const service of this.accessory.services) {
       this.updateIfPresent(service, this.platform.Characteristic.StatusActive, connected);
-      this.updateIfPresent(
-        service,
-        this.platform.Characteristic.StatusFault,
-        connected
-          ? this.platform.Characteristic.StatusFault.NO_FAULT
-          : this.platform.Characteristic.StatusFault.GENERAL_FAULT,
-      );
+    }
+
+    this.applyStatusFaultState(connected);
+  }
+
+  private updateFaultDiagnostics(connected: boolean, state: SuplaChannelState): void {
+    const diagnostics = this.readIssueDiagnostics(state);
+    const signature = diagnostics.all.join('|');
+    if (signature !== this.lastIssueSignature) {
+      if (diagnostics.all.length > 0) {
+        this.platform.log.warn(
+          `SUPLA channel ${this.channel.id}: active issue flags detected: ${diagnostics.all.join(', ')}.`,
+        );
+      } else if (this.lastIssueSignature.length > 0) {
+        this.platform.log.info(`SUPLA channel ${this.channel.id}: all issue flags cleared.`);
+      }
+      this.lastIssueSignature = signature;
+    }
+
+    this.hasDeviceFault = diagnostics.faults.length > 0;
+    this.applyStatusFaultState(connected);
+  }
+
+  private readIssueDiagnostics(state: SuplaChannelState): { all: string[]; faults: string[] } {
+    const all: string[] = [];
+    const faults: string[] = [];
+    this.includeIssueFlag(all, faults, 'motorProblem', state.motorProblem, true);
+    this.includeIssueFlag(all, faults, 'notCalibrated', state.notCalibrated, true);
+    this.includeIssueFlag(all, faults, 'calibrationError', state.calibrationError, true);
+    this.includeIssueFlag(all, faults, 'currentOverload', state.currentOverload, true);
+    this.includeIssueFlag(all, faults, 'flooding', state.flooding, true);
+    this.includeIssueFlag(all, faults, 'manuallyClosed', state.manuallyClosed, true);
+    this.includeIssueFlag(all, faults, 'forcedOffBySensor', state.forcedOffBySensor, true);
+    this.includeIssueFlag(all, faults, 'thermometerError', state.thermometerError, true);
+    this.includeIssueFlag(all, faults, 'clockError', state.clockError, true);
+    this.includeIssueFlag(all, faults, 'batteryCoverOpen', state.batteryCoverOpen, false);
+    this.includeIssueFlag(all, faults, 'warningLevel', state.warningLevel, false);
+    this.includeIssueFlag(all, faults, 'alarmLevel', state.alarmLevel, false);
+
+    const connectedCode = String(state.connectedCode ?? '').trim();
+    if (connectedCode.length > 0 && connectedCode !== '0') {
+      const normalizedCode = connectedCode.toUpperCase();
+      if (normalizedCode !== 'CONNECTED' && normalizedCode !== 'OK') {
+        all.push(`connectedCode=${connectedCode}`);
+      }
+    }
+
+    return { all, faults };
+  }
+
+  private includeIssueFlag(
+    all: string[],
+    faults: string[],
+    label: string,
+    value: unknown,
+    isFault: boolean,
+  ): void {
+    if (asBoolean(value) === true) {
+      all.push(label);
+      if (isFault) {
+        faults.push(label);
+      }
+    }
+  }
+
+  private applyStatusFaultState(connected: boolean): void {
+    const hasFault = !connected || this.hasDeviceFault;
+    const statusFault = hasFault
+      ? this.platform.Characteristic.StatusFault.GENERAL_FAULT
+      : this.platform.Characteristic.StatusFault.NO_FAULT;
+
+    for (const service of this.accessory.services) {
+      this.updateIfPresent(service, this.platform.Characteristic.StatusFault, statusFault);
     }
   }
 
@@ -517,18 +598,23 @@ export class SuplaChannelAccessory {
   }
 
   private updateGarageDoorState(state: SuplaChannelState): void {
-    const currentDoorState = this.readGarageCurrentDoorState(state);
-    const targetDoorState = this.readGarageTargetDoorState(state);
+    const physicalState = this.readGaragePhysicalState(state);
+    this.inferGatePendingMovementFromPhysicalState(physicalState);
+    const currentDoorState = this.readGarageCurrentDoorState(state, physicalState);
+    const targetDoorState = this.readGarageTargetDoorState(state, physicalState);
 
     this.targetDoorState = targetDoorState;
+    this.lastGaragePhysicalState = physicalState;
 
     this.mainService.updateCharacteristic(this.platform.Characteristic.CurrentDoorState, currentDoorState);
     this.mainService.updateCharacteristic(this.platform.Characteristic.TargetDoorState, targetDoorState);
 
-    const obstruction = (asBoolean(state.motorProblem) ?? false)
-      || (asBoolean(state.notCalibrated) ?? false)
-      || (asBoolean(state.calibrationError) ?? false);
+    const obstruction = this.readObstructionDetected(state);
     this.mainService.updateCharacteristic(this.platform.Characteristic.ObstructionDetected, obstruction);
+    this.platform.log.debug(
+      `SUPLA channel ${this.channel.id}: garage state physical=${physicalState}, current=${currentDoorState}, `
+      + `target=${targetDoorState}, obstruction=${obstruction}.`,
+    );
   }
 
   private updateLockState(state: SuplaChannelState): void {
@@ -1102,17 +1188,15 @@ export class SuplaChannelAccessory {
     const state = this.channel.state ?? {};
 
     if (functionId === SUPLA_FUNCTION.ROLLER_GARAGE_DOOR) {
-      await this.executeAction({
-        action: openRequested ? SUPLA_ACTION.REVEAL : SUPLA_ACTION.SHUT,
+      await this.performDoorMovement(openRequested, state, async () => {
+        await this.executeAction({
+          action: openRequested ? SUPLA_ACTION.REVEAL : SUPLA_ACTION.SHUT,
+        });
       });
-      this.setPendingDoorMovement(openRequested);
       return;
     }
 
-    if (
-      functionId === SUPLA_FUNCTION.CONTROLLING_THE_GATE
-      || functionId === SUPLA_FUNCTION.CONTROLLING_THE_GARAGE_DOOR
-    ) {
+    if (this.isGateToggleFunction(functionId)) {
       const hasSensors = this.hasGateSensorConfiguration();
       if (!hasSensors && !this.toggleWithoutSensorsWarningLogged) {
         this.toggleWithoutSensorsWarningLogged = true;
@@ -1139,22 +1223,56 @@ export class SuplaChannelAccessory {
       const directAction = openRequested ? SUPLA_ACTION.OPEN : SUPLA_ACTION.CLOSE;
       const canUseDirectAction = this.isActionAdvertised(directAction);
       const canUseToggleAction = this.isActionAdvertised(SUPLA_ACTION.OPEN_CLOSE);
-      const action = canUseDirectAction && (hasSensors || !canUseToggleAction)
+      const action = canUseDirectAction
         ? directAction
         : (canUseToggleAction ? SUPLA_ACTION.OPEN_CLOSE : directAction);
+      const reversingInProgress = action === SUPLA_ACTION.OPEN_CLOSE
+        && (
+          (currentDoorState === this.platform.Characteristic.CurrentDoorState.OPENING && !openRequested)
+          || (currentDoorState === this.platform.Characteristic.CurrentDoorState.CLOSING && openRequested)
+        );
 
       this.platform.log.debug(
         `SUPLA channel ${this.channel.id}: gate action strategy requested=${openRequested ? 'OPEN' : 'CLOSE'}, `
-        + `selected=${action}, directAdvertised=${canUseDirectAction}, toggleAdvertised=${canUseToggleAction}, hasSensors=${hasSensors}.`,
+        + `selected=${action}, directAdvertised=${canUseDirectAction}, toggleAdvertised=${canUseToggleAction}, `
+        + `hasSensors=${hasSensors}, reversingInProgress=${reversingInProgress}.`,
       );
-      await this.executeAction({ action });
-      this.setPendingDoorMovement(openRequested);
+      await this.performDoorMovement(openRequested, state, async () => {
+        if (reversingInProgress) {
+          this.platform.log.debug(
+            `SUPLA channel ${this.channel.id}: reversing gate movement via OPEN_CLOSE double pulse.`,
+          );
+          await this.executeAction({ action: SUPLA_ACTION.OPEN_CLOSE });
+          await this.delay(GATE_REVERSE_TOGGLE_DELAY_MS);
+        }
+        await this.executeAction({ action });
+      });
       return;
     }
 
     if (isGarageDoorFunction(functionId)) {
-      await this.executeAction({ action: openRequested ? SUPLA_ACTION.OPEN : SUPLA_ACTION.CLOSE });
-      this.setPendingDoorMovement(openRequested);
+      await this.performDoorMovement(openRequested, state, async () => {
+        await this.executeAction({ action: openRequested ? SUPLA_ACTION.OPEN : SUPLA_ACTION.CLOSE });
+      });
+    }
+  }
+
+  private async performDoorMovement(
+    expectedOpen: boolean,
+    stateSnapshot: SuplaChannelState,
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    const previousPending = this.pendingDoorMovement;
+    this.setPendingDoorMovement(expectedOpen);
+    try {
+      await operation();
+    } catch (error) {
+      this.pendingDoorMovement = previousPending;
+      this.updateGarageDoorState(stateSnapshot);
+      this.platform.log.warn(
+        `SUPLA channel ${this.channel.id}: reverting optimistic door movement state after action failure.`,
+      );
+      throw error;
     }
   }
 
@@ -1420,6 +1538,14 @@ export class SuplaChannelAccessory {
 
   private async handleValveActiveSet(value: CharacteristicValue): Promise<void> {
     const active = Number(value) === this.platform.Characteristic.Active.ACTIVE;
+    const warningFlags = active
+      ? this.readValveOpenWarningFlags(this.channel.state ?? {})
+      : this.readValveCloseWarningFlags(this.channel.state ?? {});
+    if (warningFlags.length > 0) {
+      this.platform.log.warn(
+        `SUPLA channel ${this.channel.id}: ${active ? 'opening' : 'closing'} valve while warning flags are active: ${warningFlags.join(', ')}.`,
+      );
+    }
 
     await this.executeAction({
       action: active ? SUPLA_ACTION.OPEN : SUPLA_ACTION.CLOSE,
@@ -1570,6 +1696,11 @@ export class SuplaChannelAccessory {
     service.updateCharacteristic(this.platform.Characteristic.CurrentPosition, position);
     service.updateCharacteristic(this.platform.Characteristic.TargetPosition, target);
     service.updateCharacteristic(this.platform.Characteristic.PositionState, positionState);
+    this.updateIfPresent(
+      service,
+      this.platform.Characteristic.ObstructionDetected,
+      this.readObstructionDetected(state),
+    );
 
     if (!isTiltableWindowCoveringFunction(functionId)) {
       return;
@@ -1749,8 +1880,10 @@ export class SuplaChannelAccessory {
     return clampNumber(100 - openPercent, 0, 100);
   }
 
-  private readGarageCurrentDoorState(state: SuplaChannelState): number {
-    const physicalState = this.readGaragePhysicalState(state);
+  private readGarageCurrentDoorState(
+    state: SuplaChannelState,
+    physicalState: 'open' | 'closed' | 'partial' | 'unknown' = this.readGaragePhysicalState(state),
+  ): number {
     if (physicalState === 'open') {
       this.clearPendingDoorMovement('state indicates open');
       return this.platform.Characteristic.CurrentDoorState.OPEN;
@@ -1759,11 +1892,22 @@ export class SuplaChannelAccessory {
       this.clearPendingDoorMovement('state indicates closed');
       return this.platform.Characteristic.CurrentDoorState.CLOSED;
     }
+
+    const pending = this.getPendingDoorMovement();
     if (physicalState === 'partial') {
+      if (pending) {
+        return pending.expectedOpen
+          ? this.platform.Characteristic.CurrentDoorState.OPENING
+          : this.platform.Characteristic.CurrentDoorState.CLOSING;
+      }
+
+      if (this.shouldTreatPartialAsOpen()) {
+        return this.platform.Characteristic.CurrentDoorState.OPEN;
+      }
+
       return this.platform.Characteristic.CurrentDoorState.STOPPED;
     }
 
-    const pending = this.getPendingDoorMovement();
     if (pending) {
       return pending.expectedOpen
         ? this.platform.Characteristic.CurrentDoorState.OPENING
@@ -1773,8 +1917,11 @@ export class SuplaChannelAccessory {
     return this.platform.Characteristic.CurrentDoorState.STOPPED;
   }
 
-  private readGarageTargetDoorState(state: SuplaChannelState): number {
-    const physicalState = this.readGaragePhysicalState(state);
+  private readGarageTargetDoorState(
+    state: SuplaChannelState,
+    physicalState: 'open' | 'closed' | 'partial' | 'unknown' = this.readGaragePhysicalState(state),
+  ): number {
+    const pending = this.getPendingDoorMovement();
     if (physicalState === 'open') {
       return this.platform.Characteristic.TargetDoorState.OPEN;
     }
@@ -1782,7 +1929,16 @@ export class SuplaChannelAccessory {
       return this.platform.Characteristic.TargetDoorState.CLOSED;
     }
 
-    const pending = this.getPendingDoorMovement();
+    if (physicalState === 'partial' && this.shouldTreatPartialAsOpen()) {
+      if (pending) {
+        return pending.expectedOpen
+          ? this.platform.Characteristic.TargetDoorState.OPEN
+          : this.platform.Characteristic.TargetDoorState.CLOSED;
+      }
+
+      return this.platform.Characteristic.TargetDoorState.OPEN;
+    }
+
     if (pending) {
       return pending.expectedOpen
         ? this.platform.Characteristic.TargetDoorState.OPEN
@@ -1792,14 +1948,50 @@ export class SuplaChannelAccessory {
     return this.targetDoorState ?? this.platform.Characteristic.TargetDoorState.CLOSED;
   }
 
+  private inferGatePendingMovementFromPhysicalState(
+    physicalState: 'open' | 'closed' | 'partial' | 'unknown',
+  ): void {
+    const functionId = getChannelFunctionId(this.channel);
+    if (!this.isGateToggleFunction(functionId)) {
+      return;
+    }
+
+    if (this.getPendingDoorMovement()) {
+      return;
+    }
+
+    if (physicalState !== 'partial') {
+      return;
+    }
+
+    if (this.lastGaragePhysicalState === 'closed') {
+      this.platform.log.debug(
+        `SUPLA channel ${this.channel.id}: inferred opening movement from closed->partial transition.`,
+      );
+      this.setPendingDoorMovement(true);
+      return;
+    }
+
+    if (this.lastGaragePhysicalState === 'open') {
+      this.platform.log.debug(
+        `SUPLA channel ${this.channel.id}: inferred closing movement from open->partial transition.`,
+      );
+      this.setPendingDoorMovement(false);
+    }
+  }
+
   private readGaragePhysicalState(state: SuplaChannelState): 'open' | 'closed' | 'partial' | 'unknown' {
     const openPercent = this.openPercentFromState(state);
     if (openPercent !== undefined) {
-      if (openPercent <= 5) {
+      const functionId = getChannelFunctionId(this.channel);
+      const closedThreshold = this.isGateToggleFunction(functionId) ? 0 : 5;
+      const openThreshold = this.isGateToggleFunction(functionId) ? 100 : 95;
+
+      if (openPercent <= closedThreshold) {
         return 'closed';
       }
 
-      if (openPercent >= 95) {
+      if (openPercent >= openThreshold) {
         return 'open';
       }
 
@@ -1916,14 +2108,45 @@ export class SuplaChannelAccessory {
   }
 
   private readClosedState(state: SuplaChannelState): boolean | undefined {
-    const closed = asBoolean(state.closed);
+    const closed = this.readStrictBinaryState(state.closed);
     if (closed !== undefined) {
       return closed;
     }
 
-    const hi = asBoolean(state.hi);
+    const hi = this.readStrictBinaryState(state.hi);
     if (hi !== undefined) {
       return hi;
+    }
+
+    return undefined;
+  }
+
+  private readStrictBinaryState(value: unknown): boolean | undefined {
+    if (typeof value === 'boolean') {
+      return value;
+    }
+
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === 'true' || normalized === '1') {
+        return true;
+      }
+      if (normalized === 'false' || normalized === '0') {
+        return false;
+      }
+      return undefined;
+    }
+
+    const numeric = asNumber(value);
+    if (numeric === undefined) {
+      return undefined;
+    }
+
+    if (numeric === 1) {
+      return true;
+    }
+    if (numeric === 0) {
+      return false;
     }
 
     return undefined;
@@ -1949,7 +2172,7 @@ export class SuplaChannelAccessory {
       return 'open';
     }
 
-    const hi = asBoolean(state.hi);
+    const hi = this.readStrictBinaryState(state.hi);
     const partialHi = asBoolean(state.partial_hi)
       ?? asBoolean(state.partialHi)
       ?? false;
@@ -1962,12 +2185,41 @@ export class SuplaChannelAccessory {
       return hi ? 'closed' : 'open';
     }
 
-    const closed = asBoolean(state.closed);
+    const closed = this.readStrictBinaryState(state.closed);
     if (closed !== undefined) {
       return closed ? 'closed' : 'open';
     }
 
     return undefined;
+  }
+
+  private readObstructionDetected(state: SuplaChannelState): boolean {
+    return (asBoolean(state.motorProblem) ?? false)
+      || (asBoolean(state.notCalibrated) ?? false)
+      || (asBoolean(state.calibrationError) ?? false)
+      || (asBoolean(state.currentOverload) ?? false);
+  }
+
+  private readValveOpenWarningFlags(state: SuplaChannelState): string[] {
+    const warnings: string[] = [];
+    if (asBoolean(state.flooding) === true) {
+      warnings.push('flooding');
+    }
+    if (asBoolean(state.manuallyClosed) === true) {
+      warnings.push('manuallyClosed');
+    }
+    if (asBoolean(state.motorProblem) === true) {
+      warnings.push('motorProblem');
+    }
+    return warnings;
+  }
+
+  private readValveCloseWarningFlags(state: SuplaChannelState): string[] {
+    const warnings: string[] = [];
+    if (asBoolean(state.motorProblem) === true) {
+      warnings.push('motorProblem');
+    }
+    return warnings;
   }
 
   private readColorTemperatureMired(state: SuplaChannelState): number | undefined {
@@ -2091,11 +2343,34 @@ export class SuplaChannelAccessory {
     return (openingSensorChannelId ?? 0) > 0 || (partialSensorChannelId ?? 0) > 0;
   }
 
+  private isGateToggleFunction(functionId: number): boolean {
+    return functionId === SUPLA_FUNCTION.CONTROLLING_THE_GATE
+      || functionId === SUPLA_FUNCTION.CONTROLLING_THE_GARAGE_DOOR;
+  }
+
+  private shouldTreatPartialAsOpen(): boolean {
+    return this.isGateToggleFunction(getChannelFunctionId(this.channel));
+  }
+
   private setPendingDoorMovement(expectedOpen: boolean): void {
     this.pendingDoorMovement = {
       expectedOpen,
       startedAt: Date.now(),
     };
+
+    this.mainService.updateCharacteristic(
+      this.platform.Characteristic.CurrentDoorState,
+      expectedOpen
+        ? this.platform.Characteristic.CurrentDoorState.OPENING
+        : this.platform.Characteristic.CurrentDoorState.CLOSING,
+    );
+    this.mainService.updateCharacteristic(
+      this.platform.Characteristic.TargetDoorState,
+      expectedOpen
+        ? this.platform.Characteristic.TargetDoorState.OPEN
+        : this.platform.Characteristic.TargetDoorState.CLOSED,
+    );
+
     this.platform.log.debug(
       `SUPLA channel ${this.channel.id}: pending door movement set to ${expectedOpen ? 'open' : 'closed'}.`,
     );
@@ -2549,6 +2824,17 @@ export class SuplaChannelAccessory {
     } catch {
       return '[unserializable-payload]';
     }
+  }
+
+  private async delay(ms: number): Promise<void> {
+    if (ms <= 0) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      timer.unref();
+    });
   }
 
   private updateIfPresent(
